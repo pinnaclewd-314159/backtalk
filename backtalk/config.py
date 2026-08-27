@@ -88,6 +88,11 @@ DEFAULTS = {
     # (the switch saves itself here). The --open-mic launch flag
     # forces "open" for one session.
     "mic_mode": "ptt",
+    # How much trailing silence (milliseconds) ends your turn in
+    # hands-free listening before the transcript is sent. 480 is the
+    # snappy default; raise it if you get cut off mid-thought on
+    # pauses, lower it for faster turnaround on a quiet mic.
+    "silence_ms": 480,
     # Playback speed for the built-in voice: 1.0 is Kokoro's native
     # pace, 1.15 is noticeably brisker, 0.9 is slower. Kokoro's own
     # pipeline implements it, so quality holds across sane values
@@ -127,14 +132,14 @@ DEFAULTS = {
     # remains the automatic fallback, so the voice degrades instead of
     # going mute if the cloud fails. Needs ffmpeg on the PATH.
     "elevenlabs": {
-        "enabled": False,
-        "voice_id": "",
+        "enabled": True,
+        "voice_id": "fbmRLXHnBpGkWONIARvn",
         "model": "eleven_turbo_v2_5",
         # Local mastering: ElevenLabs' site previews are mastered demo
         # clips and the raw API never matches them. This chain closes
         # the gap: presence lift, light chest, broadcast compression,
         # limiter. atempo is the one pace dial (1.0 = native).
-        "master": ("atempo=1.12,highpass=f=70,"
+        "master": ("atempo=1.0,highpass=f=70,"
                    "equalizer=f=3200:t=q:w=1.2:g=3.5,"
                    "equalizer=f=140:t=q:w=1:g=1.5,"
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"

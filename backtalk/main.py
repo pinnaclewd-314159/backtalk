@@ -630,7 +630,7 @@ async def amain():
             resume_id = None
 
     mouth = Mouth()
-    ears = Ears()
+    ears = Ears(silence_ms=CFG.get("silence_ms", 480))
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
@@ -900,7 +900,8 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(
+            speak_reply(brain, mouth, text))
         return True
 
     try:
