@@ -173,6 +173,63 @@ async def handle_connection(reader: asyncio.StreamReader,
     return conn
 
 
+async def send_reply(conn: SatelliteConnection, pcm_chunks, source_rate: int) -> bool:
+    """Streams one reply to a satellite as audio-start / audio-chunk(s) /
+    audio-stop, resampling each chunk from source_rate (Kokoro=24000,
+    ElevenLabs=44100) down to the satellite's fixed WIRE_RATE. pcm_chunks
+    may be a plain iterable or an async iterable of int16 np.ndarrays.
+
+    Returns False on any write failure -- the caller (Task 6) must stop
+    synthesizing further sentences and clean the connection out of the
+    registry when this happens, per the spec: "one satellite's failure
+    never takes the shared backtalk process down."
+    """
+    try:
+        conn.writer.write(
+            b'{"type": "audio-start", "data": {"rate": %d, "width": 2, "channels": 1}}\n'
+            % WIRE_RATE)
+        await conn.writer.drain()
+
+        async def _chunks():
+            if hasattr(pcm_chunks, "__aiter__"):
+                async for c in pcm_chunks:
+                    yield c
+            else:
+                for c in pcm_chunks:
+                    yield c
+
+        async for pcm in _chunks():
+            resampled = resample_pcm(pcm, source_rate, WIRE_RATE)
+            if resampled.size == 0:
+                continue
+            payload = resampled.tobytes()
+            header = (
+                '{"type": "audio-chunk", "data": {"rate": %d, "width": 2, '
+                '"channels": 1}, "payload_length": %d}\n'
+                % (WIRE_RATE, len(payload))
+            ).encode()
+            conn.writer.write(header + payload)
+            await conn.writer.drain()
+
+        conn.writer.write(b'{"type": "audio-stop"}\n')
+        await conn.writer.drain()
+        return True
+    except (ConnectionError, OSError) as e:
+        log(f"[satellites] {conn.name} write failed mid-reply: {e}")
+        return False
+
+
+async def send_stop(conn: SatelliteConnection) -> None:
+    """Just audio-stop, no preceding audio -- used when a satellite-owned
+    turn is interrupted by local input, so its firmware isn't left
+    waiting for audio that's never coming (spec, turn-lock section)."""
+    try:
+        conn.writer.write(b'{"type": "audio-stop"}\n')
+        await conn.writer.drain()
+    except (ConnectionError, OSError) as e:
+        log(f"[satellites] {conn.name} send_stop failed: {e}")
+
+
 if __name__ == "__main__":
     # Manual self-test, same convention as ears.py/mouth.py's own
     # __main__ blocks -- this project has no test framework.
@@ -317,3 +374,28 @@ if __name__ == "__main__":
         print("[satellites] callback exception propagation self-test: PASS")
 
     asyncio.run(_test_callback_exception_not_swallowed())
+
+    async def _test_outbound_reply():
+        written = bytearray()
+
+        class _FakeWriter:
+            def write(self, data):
+                written.extend(data)
+            async def drain(self):
+                pass
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 9999)
+            def close(self):
+                pass
+
+        conn = SatelliteConnection(reader=None, writer=_FakeWriter(), name="test")
+        tone = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 10000).astype(np.int16)
+        ok = await send_reply(conn, [tone], source_rate=24000)
+        assert ok is True
+        text = bytes(written)
+        assert text.startswith(b'{"type": "audio-start"'), "must start with audio-start"
+        assert b'"type": "audio-chunk"' in text, "must contain an audio-chunk"
+        assert text.rstrip().endswith(b'{"type": "audio-stop"}'), "must end with audio-stop"
+        print("[satellites] send_reply self-test: PASS")
+
+    asyncio.run(_test_outbound_reply())
