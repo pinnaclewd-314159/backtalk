@@ -938,6 +938,7 @@ async def amain():
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
         nonlocal speak_task
+        prev_owner = turn_lock.current_owner()
         if source != "local" and not turn_lock.try_acquire(source):
             log(f"[satellites] dropped utterance from {source.name} "
                f"(turn owned by {turn_lock.current_owner()})")
@@ -991,7 +992,6 @@ async def amain():
             _deny_pending()          # an ask never outlives its turn
             speak_task.cancel()
             mouth.shut_up()
-            prev_owner = turn_lock.current_owner()
             if prev_owner not in ("local", None) and prev_owner != source:
                 await satellites.send_stop(prev_owner)
         if speak_task:
