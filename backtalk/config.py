@@ -187,6 +187,11 @@ DEFAULTS = {
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
     "signals_dir": "",
+    # TCP port the satellite Wyoming listener binds to. 10700 is the
+    # Wyoming protocol's own convention, and jarvis-satellite/main/config.h
+    # hardcodes this exact port on the firmware side -- changing it here
+    # without a matching firmware change breaks every satellite.
+    "wyoming_port": 10700,
     # THE BAREHANDS SEAM: point this at a barehands checkout's state/
     # folder and its on-screen ring becomes your agent's face — it
     # breathes while idle, spins while thinking, pulses with the voice.

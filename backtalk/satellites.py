@@ -230,6 +230,43 @@ async def send_stop(conn: SatelliteConnection) -> None:
         log(f"[satellites] {conn.name} send_stop failed: {e}")
 
 
+class SatelliteRegistry:
+    def __init__(self):
+        self.connections: set[SatelliteConnection] = set()
+
+    def add(self, conn: SatelliteConnection) -> None:
+        self.connections.add(conn)
+
+    def remove(self, conn: SatelliteConnection) -> None:
+        self.connections.discard(conn)
+
+
+async def start_server(host: str, port: int, on_utterance,
+                       registry: SatelliteRegistry):
+    """Binds the Wyoming TCP listener. Each accepted connection runs
+    handle_connection() as its own task; the registry is updated on
+    connect/disconnect so main.py's turn-lock interrupt logic (Task 6)
+    can find and message any connected satellite."""
+
+    async def _on_client(reader, writer):
+        conn_ref = [None]  # populated once the first utterance names the connection
+
+        async def _wrapped_on_utterance(conn, pcm):
+            conn_ref[0] = conn
+            registry.add(conn)
+            await on_utterance(conn, pcm)
+
+        try:
+            await handle_connection(reader, writer, _wrapped_on_utterance)
+        finally:
+            if conn_ref[0] is not None:
+                registry.remove(conn_ref[0])
+
+    server = await asyncio.start_server(_on_client, host, port)
+    log(f"[satellites] Wyoming listener on {host}:{port}")
+    return server
+
+
 if __name__ == "__main__":
     # Manual self-test, same convention as ears.py/mouth.py's own
     # __main__ blocks -- this project has no test framework.
@@ -478,3 +515,44 @@ if __name__ == "__main__":
         print("[satellites] send_stop self-test: PASS")
 
     asyncio.run(_test_send_stop())
+
+    async def _test_server_roundtrip():
+        registry = SatelliteRegistry()
+        got = []
+
+        async def on_utterance(conn, pcm):
+            got.append(pcm)
+            await send_reply(conn, [pcm], source_rate=WIRE_RATE)
+
+        server = await start_server("127.0.0.1", 17700, on_utterance, registry)
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", 17700)
+            tone = (np.sin(2 * np.pi * 440 * np.arange(320) / 16000) * 5000).astype(np.int16)
+            payload = tone.tobytes()
+            writer.write(b'{"type": "detect", "data": {"names": ["hey_jarvis"]}}\n')
+            writer.write(b'{"type": "audio-start", "data": {"rate": 16000, "width": 2, "channels": 1}}\n')
+            writer.write(
+                ('{"type": "audio-chunk", "data": {"rate": 16000, "width": 2, "channels": 1}, "payload_length": %d}\n' % len(payload)).encode()
+                + payload)
+            writer.write(b'{"type": "audio-stop"}\n')
+            await writer.drain()
+
+            header_line = await reader.readline()
+            assert header_line.startswith(b'{"type": "audio-start"'), header_line
+            chunk_line = await reader.readline()
+            assert b'"type": "audio-chunk"' in chunk_line, chunk_line
+            plen = json.loads(chunk_line)["payload_length"]
+            await reader.readexactly(plen)
+            stop_line = await reader.readline()
+            assert stop_line.startswith(b'{"type": "audio-stop"'), stop_line
+
+            writer.close()
+            await asyncio.sleep(0.1)  # let the server-side handler unwind
+            assert len(got) == 1
+            assert np.array_equal(got[0], tone)
+            print("[satellites] start_server round-trip self-test: PASS")
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(_test_server_roundtrip())
