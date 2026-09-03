@@ -399,3 +399,82 @@ if __name__ == "__main__":
         print("[satellites] send_reply self-test: PASS")
 
     asyncio.run(_test_outbound_reply())
+
+    async def _test_outbound_reply_write_failure():
+        """Verify send_reply returns False on a write failure (drain raises),
+        and does not propagate the exception."""
+        written = bytearray()
+
+        class _FakeWriterWithFailure:
+            def __init__(self):
+                self.drain_call_count = 0
+
+            def write(self, data):
+                written.extend(data)
+
+            async def drain(self):
+                self.drain_call_count += 1
+                if self.drain_call_count == 1:
+                    raise ConnectionResetError("simulated reset")
+
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 9999)
+
+            def close(self):
+                pass
+
+        conn = SatelliteConnection(reader=None, writer=_FakeWriterWithFailure(), name="test")
+        tone = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 10000).astype(np.int16)
+        ok = await send_reply(conn, [tone], source_rate=24000)
+        assert ok is False, "send_reply must return False on write failure"
+        print("[satellites] send_reply write-failure self-test: PASS")
+
+    asyncio.run(_test_outbound_reply_write_failure())
+
+    async def _test_send_stop():
+        """Verify send_stop works in both success and failure cases,
+        and never propagates exceptions."""
+        # Success case: normal drain
+        written = bytearray()
+
+        class _FakeWriter:
+            def write(self, data):
+                written.extend(data)
+
+            async def drain(self):
+                pass
+
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 9999)
+
+            def close(self):
+                pass
+
+        conn = SatelliteConnection(reader=None, writer=_FakeWriter(), name="test")
+        await send_stop(conn)
+        assert bytes(written) == b'{"type": "audio-stop"}\n', "send_stop must write audio-stop message"
+
+        # Failure case: drain raises exception
+        written_fail = bytearray()
+
+        class _FakeWriterWithFailure:
+            def write(self, data):
+                written_fail.extend(data)
+
+            async def drain(self):
+                raise ConnectionResetError("simulated reset")
+
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 9999)
+
+            def close(self):
+                pass
+
+        conn_fail = SatelliteConnection(reader=None, writer=_FakeWriterWithFailure(), name="test")
+        # This must not raise -- send_stop must swallow the exception
+        await send_stop(conn_fail)
+        assert bytes(written_fail) == b'{"type": "audio-stop"}\n', "send_stop must still write before drain fails"
+
+        print("[satellites] send_stop self-test: PASS")
+
+    asyncio.run(_test_send_stop())
