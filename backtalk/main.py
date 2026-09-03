@@ -590,7 +590,8 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local"):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
+                      epoch: int = 0):
     """One turn's reply, routed to whichever mouth asked for it.
 
     Two genuinely different code paths, deliberately NOT threaded
@@ -598,14 +599,27 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local")
     pre-satellite code, untouched, and the satellite path has its own
     streaming/wire/signal-bus rules. The turn lock is released here, on
     every exit, and only here — handle() owns the release for turns that
-    never get this far."""
+    never get this far.
+
+    `epoch` is the turn-lock generation this turn acquired. Releasing
+    against it is what stops a turn that has already been superseded —
+    including by its OWN source re-triggering, where the owner alone
+    still matches — from clearing the lock its replacement is holding."""
     try:
         if source == "local":
-            await _speak_reply_local(brain, mouth, text)
+            try:
+                await _speak_reply_local(brain, mouth, text)
+            except Exception as e:
+                # Diagnostics only. This exception was unhandled on the
+                # local path before satellites existed and still is: it
+                # is logged and re-raised unchanged, so behaviour is
+                # byte-for-byte what it was, minus the silence.
+                log(f"[{NAME}] speak_reply failed: {e!r}")
+                raise
         else:
             await _speak_reply_satellite(brain, text, source)
     finally:
-        turn_lock.release(source)
+        turn_lock.release(source, epoch)
 
 
 async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str):
@@ -847,6 +861,13 @@ async def amain():
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
     speak_task: asyncio.Task | None = None
+    # The turn-lock epoch of the CURRENT turn — set by handle() the moment
+    # it acquires, so it is right even in the window before speak_task
+    # exists. Tracked alongside the task itself because anything that
+    # releases the lock on a turn's behalf (_on_satellite_disconnect
+    # below) has to release the SAME generation, not merely the same
+    # owner. A stale value here is harmless: release() checks it.
+    turn_epoch: int = 0
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
 
@@ -876,8 +897,10 @@ async def amain():
             speak_task.cancel()
         else:
             # No task to cancel (e.g. it dropped between transcription
-            # and task creation): hand the turn back directly.
-            turn_lock.release(conn)
+            # and task creation): hand the turn back directly, against
+            # the CURRENT turn's epoch — so a turn that has since been
+            # superseded can't be cleared out from under its replacement.
+            turn_lock.release(conn, turn_epoch)
 
     from backtalk.ears import transcribe
     await satellites.start_server(
@@ -1023,9 +1046,13 @@ async def amain():
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
-        nonlocal speak_task
+        nonlocal speak_task, turn_epoch
         prev_owner = turn_lock.current_owner()
-        if source != "local" and not turn_lock.try_acquire(source):
+        # try_acquire returns this acquisition's EPOCH (a positive int) or
+        # None when the utterance must be dropped, so the falsy check below
+        # reads exactly as it did when it returned a bool.
+        epoch = turn_lock.try_acquire(source) if source != "local" else None
+        if source != "local" and not epoch:
             owner = turn_lock.current_owner()
             # .name, never the object: a SatelliteConnection's repr would
             # otherwise be free to carry its raw mic PCM into the log file.
@@ -1033,7 +1060,11 @@ async def amain():
                f"(turn owned by {getattr(owner, 'name', owner)})")
             return True
         if source == "local":
-            turn_lock.try_acquire("local")  # always succeeds; may steal from a satellite
+            # always succeeds; may steal from a satellite
+            epoch = turn_lock.try_acquire("local")
+        # Publish it for _on_satellite_disconnect, which may need to
+        # release this turn before speak_task ever exists.
+        turn_epoch = epoch
         # THE TURN LOCK IS NOW HELD, and speak_reply's own finally is the
         # only other place that releases it — which means every path out
         # of this function that never reaches speak_task creation (a
@@ -1125,12 +1156,12 @@ async def amain():
             _deny_pending()
             await brain.reset_turn()
             speak_task = asyncio.create_task(
-                speak_reply(brain, mouth, text, source=source))
+                speak_reply(brain, mouth, text, source=source, epoch=epoch))
             started_speak = True
             return True
         finally:
             if not started_speak:
-                turn_lock.release(source)
+                turn_lock.release(source, epoch)
 
     try:
         # ONE loop, two mic modes, switchable live (_MIC). The talk key

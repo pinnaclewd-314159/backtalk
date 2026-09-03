@@ -55,6 +55,7 @@ class TurnLock:
 
     def __init__(self):
         self._owner = None
+        self._epoch = 0
 
     def current_owner(self):
         return self._owner
@@ -62,20 +63,25 @@ class TurnLock:
     def is_active(self) -> bool:
         return self._owner is not None
 
-    def try_acquire(self, owner) -> bool:
-        """True and takes ownership if allowed to proceed: no active turn,
-        local input (always wins), or this is the same owner re-triggering
-        itself. False (and no state change) means: drop this utterance."""
+    def try_acquire(self, owner):
+        """Returns the newly-acquired epoch (a positive int, always
+        truthy) on success, or None if the utterance should be dropped.
+        Every successful acquisition -- including a SAME-owner
+        re-trigger -- starts a new epoch: a self-retrigger is a genuinely
+        new turn, and this is what makes a stale release() from the turn
+        it replaced unable to clobber it."""
         if owner == "local" or self._owner is None or self._owner == owner:
             self._owner = owner
-            return True
-        return False
+            self._epoch += 1
+            return self._epoch
+        return None
 
-    def release(self, owner) -> None:
-        """Clears ownership if the caller actually holds it (a stale
-        release from an already-superseded turn must not clobber a NEWER
-        turn that has since acquired the lock)."""
-        if self._owner == owner:
+    def release(self, owner, epoch) -> None:
+        """Clears ownership only if the caller both still holds it AND is
+        releasing the CURRENT epoch -- a release from a turn that's since
+        been superseded (even by its own owner re-triggering) must not
+        clobber the newer turn that replaced it."""
+        if self._owner == owner and self._epoch == epoch:
             self._owner = None
 
 
@@ -374,20 +380,44 @@ if __name__ == "__main__":
     # Manual self-test, same convention as ears.py/mouth.py's own
     # __main__ blocks -- this project has no test framework.
     lock = TurnLock()
-    assert lock.try_acquire("local") is True
+    ep_local = lock.try_acquire("local")
+    assert ep_local, "local must always be able to acquire"
     assert lock.current_owner() == "local"
-    assert lock.try_acquire("sat_a") is False, "local turn must not be stolen"
-    lock.release("local")
+    assert lock.try_acquire("sat_a") is None, "local turn must not be stolen"
+    lock.release("local", ep_local)
     assert lock.current_owner() is None
-    assert lock.try_acquire("sat_a") is True
-    assert lock.try_acquire("sat_b") is False, "a different satellite must be dropped"
-    assert lock.try_acquire("sat_a") is True, "the SAME satellite may re-trigger itself"
-    assert lock.try_acquire("local") is True, "local always wins, even over a satellite"
-    lock.release("sat_a")  # stale release from the superseded turn
+    ep_a = lock.try_acquire("sat_a")
+    assert ep_a, "an unowned turn must be acquirable"
+    assert lock.try_acquire("sat_b") is None, "a different satellite must be dropped"
+    ep_a2 = lock.try_acquire("sat_a")
+    assert ep_a2, "the SAME satellite may re-trigger itself"
+    ep_local2 = lock.try_acquire("local")
+    assert ep_local2, "local always wins, even over a satellite"
+    lock.release("sat_a", ep_a2)  # stale release from the superseded turn
     assert lock.current_owner() == "local", "a stale release must not clobber a newer owner"
-    lock.release("local")
+    lock.release("local", ep_local2)
     assert lock.current_owner() is None
     print("[satellites] TurnLock self-test: PASS")
+
+    # THE SELF-INTERRUPT REGRESSION. Owner-matching alone was not enough:
+    # when a source interrupted ITSELF, the superseded turn's release
+    # matched the (unchanged) owner and cleared a lock the replacement
+    # turn was still holding, leaving the turn unowned for its whole
+    # duration -- so a DIFFERENT satellite could take it out from under
+    # the one that was actually speaking. The epoch is what closes that.
+    lock = TurnLock()
+    old_epoch = lock.try_acquire("sat_a")
+    new_epoch = lock.try_acquire("sat_a")     # the same satellite re-triggers
+    assert old_epoch != new_epoch, "a self-retrigger must start a NEW epoch"
+    lock.release("sat_a", old_epoch)          # the superseded turn unwinds
+    assert lock.current_owner() == "sat_a", \
+        "a stale release from a self-superseded turn must be a no-op"
+    assert lock.try_acquire("sat_b") is None, \
+        "the lock must still genuinely be HELD, not just report an owner"
+    lock.release("sat_a", new_epoch)          # the live turn finishes
+    assert lock.current_owner() is None, "the current epoch's release must work"
+    assert lock.try_acquire("sat_b"), "and the turn is free again afterwards"
+    print("[satellites] TurnLock self-interrupt epoch self-test: PASS")
 
     tone = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 10000).astype(np.int16)
     down = resample_pcm(tone, 24000, 16000)
