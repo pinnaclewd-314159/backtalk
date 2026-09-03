@@ -36,6 +36,7 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **The ElevenLabs key** lives in the `ELEVENLABS_API_KEY` environment variable for now; Credential Manager support is planned.
 - **One copy at a time:** run.sh's single-instance guard is Mac and Linux; on Windows, close the old window before starting a new one, or two voices answer one mic.
 - **Speed:** `stt_device: "auto"` uses CUDA when present and CPU otherwise; CPU with `small.en` is plenty fast on a normal machine.
+- **This repo's `.venv\Scripts` can shadow the system `python` on PATH for *other* tools/terminals**, not just backtalk itself — plain `python` resolves to `backtalk\.venv\Scripts\python.exe` ahead of the real interpreter. Bit us installing the ESP-IDF toolchain (2026-09-02): its setup script saw it was already "inside a venv" and refused to create its own. If some unrelated tool's install/build script mysteriously complains about an active virtualenv, check `(Get-Command python).Source` first — if it points into this `.venv`, strip that folder from `$env:PATH` for that command rather than touching backtalk's own venv.
 
 ## The voice went robotic again (ElevenLabs users)
 
