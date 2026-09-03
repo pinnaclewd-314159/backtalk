@@ -47,6 +47,17 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 
 _model = None
 _model_lock = threading.Lock()
+# ONE model instance, and since the Wyoming satellite listener landed there
+# are several callers: the local mic loop, and one task per connected
+# satellite. Neither faster-whisper nor mlx-whisper documents a single
+# model object as safe for concurrent inference, so every transcription in
+# this process is serialized here. It has to be a threading lock rather
+# than an asyncio one: transcribe() is reached from executor THREADS
+# (ears.listen_once and record_held both call it from inside a blocking
+# capture), so an event-loop lock would guard nothing there — and holding
+# one across the whole capture would starve satellite transcription for as
+# long as the open mic sits waiting for someone to speak.
+_stt_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
 
 
@@ -326,18 +337,26 @@ def warm():
 def transcribe(pcm: np.ndarray) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
-    if nothing remains, it was silence."""
+    if nothing remains, it was silence.
+
+    Serialized process-wide (_stt_lock): several callers can reach the
+    one global model at once now that satellites are a thing. The lock
+    is taken around the inference only — never around mic capture — so a
+    waiting caller is delayed by one transcription, not by a listen."""
     model = warm()
     audio = pcm.astype(np.float32) / 32768.0
     lang = "en" if CFG["stt_model"].endswith(".en") else None
-    if _backend == "mlx":
-        import mlx_whisper
-        text = mlx_whisper.transcribe(audio, path_or_hf_repo=model,
-                                      temperature=0.0, language=lang,
-                                      verbose=None)["text"].strip()
-    else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
-        text = "".join(s.text for s in segments).strip()
+    with _stt_lock:
+        if _backend == "mlx":
+            import mlx_whisper
+            text = mlx_whisper.transcribe(audio, path_or_hf_repo=model,
+                                          temperature=0.0, language=lang,
+                                          verbose=None)["text"].strip()
+        else:
+            segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+            # faster-whisper is lazy: the generator must be drained INSIDE
+            # the lock or the actual inference would run outside it.
+            text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 
 

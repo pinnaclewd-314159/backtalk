@@ -61,6 +61,7 @@ import sys
 import threading
 import time
 
+from backtalk import satellites
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
@@ -407,6 +408,16 @@ _PASTE_OFF = "\x1b[201~"
 # swallow a paragraph into one "tag".
 _DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
 
+# Shared satellite state, module-level singletons -- the same pattern this
+# file already uses for _AUTOAPPROVE/_MIC. speak_reply() is a top-level
+# function (not nested inside amain()), so it cannot see amain()'s locals;
+# handle() and amain() reach these the same way, by ordinary module-global
+# lookup. Nothing here is ever rebound, only mutated via method calls
+# (.try_acquire()/.release()/.add()/.remove()/.current_owner()), so no
+# `global` declaration is needed anywhere.
+turn_lock = satellites.TurnLock()
+sat_registry = satellites.SatelliteRegistry()
+
 
 def _clean_typed(line: str) -> str:
     """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
@@ -579,7 +590,39 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
+                      epoch: int = 0):
+    """One turn's reply, routed to whichever mouth asked for it.
+
+    Two genuinely different code paths, deliberately NOT threaded
+    through one shared closure: the local path below is the original
+    pre-satellite code, untouched, and the satellite path has its own
+    streaming/wire/signal-bus rules. The turn lock is released here, on
+    every exit, and only here — handle() owns the release for turns that
+    never get this far.
+
+    `epoch` is the turn-lock generation this turn acquired. Releasing
+    against it is what stops a turn that has already been superseded —
+    including by its OWN source re-triggering, where the owner alone
+    still matches — from clearing the lock its replacement is holding."""
+    try:
+        if source == "local":
+            try:
+                await _speak_reply_local(brain, mouth, text)
+            except Exception as e:
+                # Diagnostics only. This exception was unhandled on the
+                # local path before satellites existed and still is: it
+                # is logged and re-raised unchanged, so behaviour is
+                # byte-for-byte what it was, minus the silence.
+                log(f"[{NAME}] speak_reply failed: {e!r}")
+                raise
+        else:
+            await _speak_reply_satellite(brain, text, source)
+    finally:
+        turn_lock.release(source, epoch)
+
+
+async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
     short sentences come out flat)."""
@@ -636,6 +679,105 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+
+
+async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
+    """The same turn, heard in another room. Sentences are synthesized
+    directly (mouth.synth_stream) and streamed to the satellite instead
+    of the local speaker queue — the whole point of a satellite is being
+    heard where you are.
+
+    ONE send_reply call per TURN, never per sentence: the spec's wire
+    format is one audio-start, chunks as they synthesize, one audio-stop
+    when the whole reply is done. The generator below is what keeps that
+    envelope open while still streaming incrementally — nothing is
+    buffered up front, each chunk goes out the moment the TTS renders
+    it, carrying its own sample rate so a mid-reply engine fallback
+    (ElevenLabs 44.1k -> Kokoro 24k) resamples correctly.
+
+    The signal bus is driven from here too: a satellite turn never
+    touches mouth.py's playback worker, which is the only other place
+    that moves the bus off "thinking"."""
+    from backtalk.mouth import synth_stream  # local import: avoids a
+    # module-level import cycle risk between main.py and mouth.py at
+    # startup, matching the pattern of other lazy imports already in
+    # this file (e.g. inside make_permission_gate).
+    t0 = time.time()
+    speaking = False
+
+    def _mark_speaking():
+        # The first byte of real audio is where a satellite turn stops
+        # "thinking" and starts "speaking" — the same moment mouth.py's
+        # worker publishes it for a local turn.
+        nonlocal speaking
+        if not speaking:
+            speaking = True
+            signals.static_stop()
+            signals.set_state("speaking")
+
+    async def _rated_chunks():
+        """(rate, pcm) for the WHOLE reply, in order, as it renders."""
+        try:
+            async for sentence in brain.ask_stream(text):
+                # Directions are stripped, never spoken. There is no local
+                # signal-bus listener relevant to a satellite's room, so
+                # they are dropped rather than published against audio
+                # nobody here can hear.
+                raw = _DIRECTION_TAG.sub(" ", sentence)
+                s = " ".join(raw.replace("`", "").split()).strip()
+                if not s:
+                    continue
+                log(f"[{NAME}->{conn.name}] ({time.time()-t0:.1f}s) {s}")
+                for rate, pcm in synth_stream(s):
+                    _mark_speaking()
+                    yield rate, pcm
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A genuine mid-turn failure (not an interrupt). The spec
+            # requires a satellite-bound turn to SAY that something broke
+            # — otherwise the person in the other room just hears silence
+            # forever with no idea why. The apology rides INSIDE the same
+            # envelope, so the reply still ends with exactly one
+            # audio-stop. (If the socket is what died, send_reply has
+            # already closed this generator and none of this runs.)
+            log(f"[{NAME}] speak_reply failed: {e!r}")
+            try:
+                for rate, pcm in synth_stream(
+                        "Sorry, something went wrong on my end."):
+                    _mark_speaking()
+                    yield rate, pcm
+            except Exception:
+                pass
+
+    gen = _rated_chunks()
+    try:
+        ok = await satellites.send_reply(conn, gen)
+        if not ok:
+            # The socket died mid-reply. send_reply already abandoned the
+            # generator (so nothing further is synthesized), and there is
+            # nothing left to say to a connection that is gone — no
+            # apology, no audio-stop.
+            sat_registry.remove(conn)
+    except asyncio.CancelledError:
+        try:
+            await brain.interrupt()
+        except Exception:
+            pass
+        # The envelope is open and no audio-stop was written: tell the
+        # firmware the audio it is waiting for isn't coming.
+        await satellites.send_stop(conn)
+        raise
+    finally:
+        try:
+            # Deterministic: stop synthesizing NOW rather than whenever
+            # the generator happens to be finalized.
+            await gen.aclose()
+        except BaseException:
+            pass
+        signals.static_stop()
+        signals.reply_done()
+        signals.set_state("idle")
 
 
 async def amain():
@@ -719,8 +861,52 @@ async def amain():
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
     speak_task: asyncio.Task | None = None
+    # The turn-lock epoch of the CURRENT turn — set by handle() the moment
+    # it acquires, so it is right even in the window before speak_task
+    # exists. Tracked alongside the task itself because anything that
+    # releases the lock on a turn's behalf (_on_satellite_disconnect
+    # below) has to release the SAME generation, not merely the same
+    # owner. A stale value here is harmless: release() checks it.
+    turn_epoch: int = 0
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+
+    async def _on_satellite_utterance(conn, pcm):
+        if pcm.size == 0:
+            return
+        # transcribe() serializes internally (ears._STT_LOCK): one global
+        # model instance, and this can now run alongside the local mic's
+        # own transcription or a second satellite's.
+        text = await loop.run_in_executor(None, transcribe, pcm)
+        if text:
+            await handle(text, source=conn)
+
+    def _on_satellite_disconnect(conn):
+        """A satellite that vanishes (reboot, network hiccup) while it
+        owns the active turn cancels that turn, exactly like any other
+        interrupt — the spec requires it, and satellites.py deliberately
+        knows nothing about turn locks, so the reaction lives here. The
+        cancellation is the same mechanism handle()'s interrupt block
+        uses; speak_reply's finally then releases the lock the normal
+        way, so this never touches turn_lock itself."""
+        if turn_lock.current_owner() is not conn:
+            return
+        if speak_task and not speak_task.done():
+            log(f"[satellites] {conn.name} dropped while owning the turn "
+                f"— cancelling it")
+            speak_task.cancel()
+        else:
+            # No task to cancel (e.g. it dropped between transcription
+            # and task creation): hand the turn back directly, against
+            # the CURRENT turn's epoch — so a turn that has since been
+            # superseded can't be cleared out from under its replacement.
+            turn_lock.release(conn, turn_epoch)
+
+    from backtalk.ears import transcribe
+    await satellites.start_server(
+        "0.0.0.0", CFG["wyoming_port"], _on_satellite_utterance, sat_registry,
+        on_disconnect=_on_satellite_disconnect)
+    log(f"[backtalk] satellite listener on port {CFG['wyoming_port']}")
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -856,86 +1042,126 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None, source="local") -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
-        nonlocal speak_task
-        log(f"[you]    {text}")
-        # A pending spoken permission ask owns the next utterance IF
-        # that utterance started after the ask was posed. Speech that
-        # began earlier is the user interrupting the turn, not
-        # answering a question they never heard: the ask resolves as a
-        # silent deny and the utterance falls through as a normal
-        # interrupt. Quit wins either way, but only as an EXACT phrase
-        # here ("No! Don't hang up, skip it" must stay a deny reason,
-        # not kill the session).
-        if _PERM["fut"] is not None and not _PERM["fut"].done():
-            started_after = (spoke_from is None
-                             or spoke_from >= _PERM["asked_at"])
-            if _norm_speech(text) in {_norm_speech(q)
-                                      for q in QUIT_PHRASES}:
-                _PERM["fut"].set_result("no")
-                # falls through to the quit body below
-            elif started_after:
-                _PERM["fut"].set_result(text)
-                return True
-            else:
-                _deny_pending()
-        # A pending auto-approve confirm owns it too, for two minutes;
-        # after that it expires and speech flows normally again.
-        verb = None
-        if _CONFIRM["verb"]:
-            pend, _CONFIRM["verb"] = _CONFIRM["verb"], None
-            expired = time.monotonic() - _CONFIRM["at"] > 120
-            if not expired and _norm_speech(text) in (
-                    "confirm", "confirmed", "yes confirm",
-                    "yes confirmed"):
-                verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
-                                         for q in QUIT_PHRASES):
-                mouth.say("Staying as we are.")
-                return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
-            if speak_task and not speak_task.done():
-                speak_task.cancel()
-            mouth.shut_up()
-            mouth.say(CFG["signoff"])
-            mouth.wait_done(timeout=15)
-            return False
-        if speak_task and not speak_task.done():
-            log("[turn] interrupted mid-reply by new input")
-            _deny_pending()          # an ask never outlives its turn
-            speak_task.cancel()
-            mouth.shut_up()
-        if speak_task:
-            # Let the cancellation fully land (its brain.interrupt()
-            # included) BEFORE anything else touches the brain —
-            # otherwise the dead turn's stop signal can race in after
-            # the new query and kill the new answer (half of the
-            # off-by-one bug; see brain.reset_turn for the other half).
-            try:
-                await speak_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            speak_task = None
-        verb = verb or console_match(text)
-        if verb:
-            await run_console(verb)
+        nonlocal speak_task, turn_epoch
+        prev_owner = turn_lock.current_owner()
+        # try_acquire returns this acquisition's EPOCH (a positive int) or
+        # None when the utterance must be dropped, so the falsy check below
+        # reads exactly as it did when it returned a bool.
+        epoch = turn_lock.try_acquire(source) if source != "local" else None
+        if source != "local" and not epoch:
+            owner = turn_lock.current_owner()
+            # .name, never the object: a SatelliteConnection's repr would
+            # otherwise be free to carry its raw mic PCM into the log file.
+            log(f"[satellites] dropped utterance from {source.name} "
+               f"(turn owned by {getattr(owner, 'name', owner)})")
             return True
-        signals.set_state("thinking")
-        signals.static_start()
-        # Clean the pipe: drain the interrupted turn's leftovers so the
-        # new question can't pair with a stale ResultMessage. A gate
-        # that fired in the meantime resolves first, or the drain would
-        # wait on a ResultMessage the CLI is withholding for an answer.
-        _deny_pending()
-        await brain.reset_turn()
-        speak_task = asyncio.create_task(
-            speak_reply(brain, mouth, text))
-        return True
+        if source == "local":
+            # always succeeds; may steal from a satellite
+            epoch = turn_lock.try_acquire("local")
+        # Publish it for _on_satellite_disconnect, which may need to
+        # release this turn before speak_task ever exists.
+        turn_epoch = epoch
+        # THE TURN LOCK IS NOW HELD, and speak_reply's own finally is the
+        # only other place that releases it — which means every path out
+        # of this function that never reaches speak_task creation (a
+        # console verb, "staying as we are", answering a permission gate
+        # or a confirm, a quit phrase, or any exception) would leak it
+        # forever. One console verb at the PC would lock every satellite
+        # out until some later local turn happened to complete normally.
+        # So: hold the lock inside a try/finally and give it back unless
+        # a FRESH speak_task actually took ownership. The flag is set at
+        # the single line that creates that task, so the finally needs no
+        # knowledge of where control left from — every return is covered.
+        # It must NOT release when a task was created: that release
+        # belongs to the task, and doing it twice could clear a lock a
+        # newer utterance has since acquired.
+        started_speak = False
+        try:
+            log(f"[you]    {text}")
+            # A pending spoken permission ask owns the next utterance IF
+            # that utterance started after the ask was posed. Speech that
+            # began earlier is the user interrupting the turn, not
+            # answering a question they never heard: the ask resolves as a
+            # silent deny and the utterance falls through as a normal
+            # interrupt. Quit wins either way, but only as an EXACT phrase
+            # here ("No! Don't hang up, skip it" must stay a deny reason,
+            # not kill the session).
+            if _PERM["fut"] is not None and not _PERM["fut"].done():
+                started_after = (spoke_from is None
+                                 or spoke_from >= _PERM["asked_at"])
+                if _norm_speech(text) in {_norm_speech(q)
+                                          for q in QUIT_PHRASES}:
+                    _PERM["fut"].set_result("no")
+                    # falls through to the quit body below
+                elif started_after:
+                    _PERM["fut"].set_result(text)
+                    return True
+                else:
+                    _deny_pending()
+            # A pending auto-approve confirm owns it too, for two minutes;
+            # after that it expires and speech flows normally again.
+            verb = None
+            if _CONFIRM["verb"]:
+                pend, _CONFIRM["verb"] = _CONFIRM["verb"], None
+                expired = time.monotonic() - _CONFIRM["at"] > 120
+                if not expired and _norm_speech(text) in (
+                        "confirm", "confirmed", "yes confirm",
+                        "yes confirmed"):
+                    verb = pend + ":confirmed"
+                elif not expired and not any(q in text.lower()
+                                             for q in QUIT_PHRASES):
+                    mouth.say("Staying as we are.")
+                    return True
+            if any(q in text.lower() for q in QUIT_PHRASES):
+                if speak_task and not speak_task.done():
+                    speak_task.cancel()
+                mouth.shut_up()
+                mouth.say(CFG["signoff"])
+                mouth.wait_done(timeout=15)
+                return False
+            if speak_task and not speak_task.done():
+                log("[turn] interrupted mid-reply by new input")
+                _deny_pending()          # an ask never outlives its turn
+                speak_task.cancel()
+                mouth.shut_up()
+                if prev_owner not in ("local", None) and prev_owner != source:
+                    await satellites.send_stop(prev_owner)
+            if speak_task:
+                # Let the cancellation fully land (its brain.interrupt()
+                # included) BEFORE anything else touches the brain —
+                # otherwise the dead turn's stop signal can race in after
+                # the new query and kill the new answer (half of the
+                # off-by-one bug; see brain.reset_turn for the other half).
+                try:
+                    await speak_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                speak_task = None
+            verb = verb or console_match(text)
+            if verb:
+                await run_console(verb)
+                return True
+            signals.set_state("thinking")
+            signals.static_start()
+            # Clean the pipe: drain the interrupted turn's leftovers so the
+            # new question can't pair with a stale ResultMessage. A gate
+            # that fired in the meantime resolves first, or the drain would
+            # wait on a ResultMessage the CLI is withholding for an answer.
+            _deny_pending()
+            await brain.reset_turn()
+            speak_task = asyncio.create_task(
+                speak_reply(brain, mouth, text, source=source, epoch=epoch))
+            started_speak = True
+            return True
+        finally:
+            if not started_speak:
+                turn_lock.release(source, epoch)
 
     try:
         # ONE loop, two mic modes, switchable live (_MIC). The talk key
