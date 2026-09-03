@@ -133,22 +133,27 @@ async def handle_connection(reader: asyncio.StreamReader,
             if msg is None:
                 break
             msg_type = msg.get("type")
-            if msg_type == "detect":
-                names = (msg.get("data") or {}).get("names")
-                log(f"[satellites] {name} detect: {names}")
-            elif msg_type == "audio-start":
-                conn._buffer = bytearray()
-            elif msg_type == "audio-chunk":
-                payload_len = int((msg.get("payload_length")) or 0)
-                payload = await reader.readexactly(payload_len) if payload_len else b""
-                conn._buffer.extend(payload)
-            elif msg_type == "audio-stop":
-                pcm = np.frombuffer(bytes(conn._buffer), dtype=np.int16)
-                conn._buffer = bytearray()
-                await on_utterance(conn, pcm)
-            # unknown message types are silently ignored -- forward
-            # compatible with future Wyoming message types this listener
-            # doesn't need to act on
+            try:
+                if msg_type == "detect":
+                    names = (msg.get("data") or {}).get("names")
+                    log(f"[satellites] {name} detect: {names}")
+                elif msg_type == "audio-start":
+                    conn._buffer = bytearray()
+                elif msg_type == "audio-chunk":
+                    payload_len = int((msg.get("payload_length")) or 0)
+                    payload = await reader.readexactly(payload_len) if payload_len else b""
+                    conn._buffer.extend(payload)
+                elif msg_type == "audio-stop":
+                    pcm = np.frombuffer(bytes(conn._buffer), dtype=np.int16)
+                    conn._buffer = bytearray()
+                    await on_utterance(conn, pcm)
+                # unknown message types are silently ignored -- forward
+                # compatible with future Wyoming message types this listener
+                # doesn't need to act on
+            except (ValueError, TypeError) as e:
+                log(f"[satellites] {name} malformed message (skipped): {e}")
+                conn._buffer = bytearray()  # discard any partial utterance
+                continue
     except (asyncio.IncompleteReadError, ConnectionResetError) as e:
         log(f"[satellites] {name} disconnected mid-stream: {e}")
     finally:
@@ -223,3 +228,45 @@ if __name__ == "__main__":
         print("[satellites] handle_connection self-test: PASS")
 
     asyncio.run(_test_inbound_parsing())
+
+    async def _test_malformed_message_recovery():
+        """Verify malformed audio-chunk messages don't crash the connection;
+        they must be logged and skipped, and the connection must stay open."""
+        received = []
+
+        async def fake_on_utterance(conn, pcm):
+            received.append((conn.name, pcm))
+
+        # Test: non-numeric payload_length in audio-chunk (should be caught, logged, skipped)
+        # Then a valid utterance to verify the connection stays open.
+        chunk_pcm = np.array([100, -100], dtype=np.int16)
+        wire = (
+            b'{"type": "audio-start", "data": {"rate": 16000, "width": 2, "channels": 1}}\n'
+            + b'{"type": "audio-chunk", "data": {"rate": 16000, "width": 2, "channels": 1}, "payload_length": "not_a_number"}\n'
+            # Start fresh without sending audio-stop (skip the empty utterance)
+            + b'{"type": "audio-start", "data": {"rate": 16000, "width": 2, "channels": 1}}\n'
+            + ('{"type": "audio-chunk", "data": {"rate": 16000, "width": 2, "channels": 1}, "payload_length": %d}\n' % (chunk_pcm.nbytes)).encode()
+            + chunk_pcm.tobytes()
+            + b'{"type": "audio-stop"}\n'
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(wire)
+        reader.feed_eof()
+
+        class _FakeWriter:
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 12346)
+            def close(self):
+                pass
+
+        # This should NOT raise an exception; the malformed chunk should be skipped
+        await handle_connection(reader, _FakeWriter(), fake_on_utterance)
+        # After the malformed chunk was skipped and discarded, the connection
+        # remained open and processed the subsequent valid utterance.
+        assert len(received) == 1, f"expected 1 valid utterance, got {len(received)}"
+        name, pcm = received[0]
+        assert name == "127.0.0.1:12346"
+        assert np.array_equal(pcm, chunk_pcm), "valid utterance must parse correctly after malformed chunk"
+        print("[satellites] malformed message recovery self-test: PASS")
+
+    asyncio.run(_test_malformed_message_recovery())
