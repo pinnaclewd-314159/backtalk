@@ -133,27 +133,34 @@ async def handle_connection(reader: asyncio.StreamReader,
             if msg is None:
                 break
             msg_type = msg.get("type")
-            try:
-                if msg_type == "detect":
-                    names = (msg.get("data") or {}).get("names")
-                    log(f"[satellites] {name} detect: {names}")
-                elif msg_type == "audio-start":
-                    conn._buffer = bytearray()
-                elif msg_type == "audio-chunk":
+            if msg_type == "detect":
+                names = (msg.get("data") or {}).get("names")
+                log(f"[satellites] {name} detect: {names}")
+            elif msg_type == "audio-start":
+                conn._buffer = bytearray()
+            elif msg_type == "audio-chunk":
+                try:
                     payload_len = int((msg.get("payload_length")) or 0)
                     payload = await reader.readexactly(payload_len) if payload_len else b""
-                    conn._buffer.extend(payload)
-                elif msg_type == "audio-stop":
+                except (ValueError, TypeError) as e:
+                    log(f"[satellites] {name} malformed message (skipped): {e}")
+                    conn._buffer = bytearray()  # discard any partial utterance
+                    continue
+                conn._buffer.extend(payload)
+            elif msg_type == "audio-stop":
+                try:
                     pcm = np.frombuffer(bytes(conn._buffer), dtype=np.int16)
-                    conn._buffer = bytearray()
-                    await on_utterance(conn, pcm)
-                # unknown message types are silently ignored -- forward
-                # compatible with future Wyoming message types this listener
-                # doesn't need to act on
-            except (ValueError, TypeError) as e:
-                log(f"[satellites] {name} malformed message (skipped): {e}")
-                conn._buffer = bytearray()  # discard any partial utterance
-                continue
+                except ValueError as e:
+                    log(f"[satellites] {name} malformed message (skipped): {e}")
+                    conn._buffer = bytearray()  # discard any partial utterance
+                    continue
+                conn._buffer = bytearray()
+                # on_utterance callback exceptions are NOT caught here -- they
+                # propagate normally, not mislabeled as protocol errors
+                await on_utterance(conn, pcm)
+            # unknown message types are silently ignored -- forward
+            # compatible with future Wyoming message types this listener
+            # doesn't need to act on
     except (asyncio.IncompleteReadError, ConnectionResetError) as e:
         log(f"[satellites] {name} disconnected mid-stream: {e}")
     finally:
@@ -270,3 +277,43 @@ if __name__ == "__main__":
         print("[satellites] malformed message recovery self-test: PASS")
 
     asyncio.run(_test_malformed_message_recovery())
+
+    async def _test_callback_exception_not_swallowed():
+        """Verify that exceptions raised by the on_utterance callback are NOT
+        caught and logged as malformed messages -- they should propagate normally."""
+
+        async def failing_on_utterance(conn, pcm):
+            # Simulate a real bug in the downstream handler
+            raise ValueError("callback intentionally failed for testing")
+
+        chunk_pcm = np.array([100, -100], dtype=np.int16)
+        wire = (
+            b'{"type": "audio-start", "data": {"rate": 16000, "width": 2, "channels": 1}}\n'
+            + ('{"type": "audio-chunk", "data": {"rate": 16000, "width": 2, "channels": 1}, "payload_length": %d}\n' % (chunk_pcm.nbytes)).encode()
+            + chunk_pcm.tobytes()
+            + b'{"type": "audio-stop"}\n'
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(wire)
+        reader.feed_eof()
+
+        class _FakeWriter:
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 12347)
+            def close(self):
+                pass
+
+        # The callback will raise ValueError; this should propagate, not be
+        # caught and logged as "malformed message"
+        caught_exception = False
+        try:
+            await handle_connection(reader, _FakeWriter(), failing_on_utterance)
+        except ValueError as e:
+            caught_exception = True
+            # Verify it's the callback's error, not a protocol error
+            assert "callback intentionally failed" in str(e), f"expected callback error, got {e}"
+
+        assert caught_exception, "callback exception must propagate, not be swallowed"
+        print("[satellites] callback exception propagation self-test: PASS")
+
+    asyncio.run(_test_callback_exception_not_swallowed())
