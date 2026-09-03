@@ -61,6 +61,7 @@ import sys
 import threading
 import time
 
+from backtalk import satellites
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
@@ -407,6 +408,16 @@ _PASTE_OFF = "\x1b[201~"
 # swallow a paragraph into one "tag".
 _DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
 
+# Shared satellite state, module-level singletons -- the same pattern this
+# file already uses for _AUTOAPPROVE/_MIC. speak_reply() is a top-level
+# function (not nested inside amain()), so it cannot see amain()'s locals;
+# handle() and amain() reach these the same way, by ordinary module-global
+# lookup. Nothing here is ever rebound, only mutated via method calls
+# (.try_acquire()/.release()/.add()/.remove()/.current_owner()), so no
+# `global` declaration is needed anywhere.
+turn_lock = satellites.TurnLock()
+sat_registry = satellites.SatelliteRegistry()
+
 
 def _clean_typed(line: str) -> str:
     """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
@@ -579,16 +590,23 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local"):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). When source is a satellite
+    connection, sentences are synthesized directly (mouth.synth_stream)
+    and streamed to that connection instead of the local speaker queue —
+    the whole point of a satellite is being heard in its own room."""
+    from backtalk.mouth import synth_stream  # local import: avoids a
+    # module-level import cycle risk between main.py and mouth.py at
+    # startup, matching the pattern of other lazy imports already in
+    # this file (e.g. inside make_permission_gate).
     t0 = time.time()
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
 
-    def emit(raw: str):
+    async def emit(raw: str):
         nonlocal first, batch, pending
         # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
         # lifted out here, never spoken, and published on the signal bus when
@@ -605,37 +623,84 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
             return
-        if first:
-            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
-                + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
-            pending = []
-            first = False
-        else:
-            log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
-            batch.append(s)
-            if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
+        if source == "local":
+            if first:
+                log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
+                    + (f"  <directions: {pending}>" if pending else ""))
+                mouth.say_chunk(s, pending)
                 pending = []
-                batch = []
+                first = False
+            else:
+                log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
+                batch.append(s)
+                if len(batch) >= 2:
+                    mouth.say_chunk(" ".join(batch), pending)
+                    pending = []
+                    batch = []
+            return
+        # Satellite-bound: synthesize this sentence directly and stream
+        # it out over the connection. No batching -- unlike local
+        # playback there's no shared queue to smooth over, and sending
+        # sentence-by-sentence keeps latency down for the person waiting
+        # in another room. Directions were already stripped above; there's
+        # no local signal-bus listener relevant to a satellite's room, so
+        # just drop anything pending rather than let it accumulate unused.
+        pending = []
+        log(f"[{NAME}->{source.name}] ({time.time()-t0:.1f}s) {s}")
+        rate_holder = {}
+
+        async def _pcm_iter():
+            for rate, pcm in synth_stream(s):
+                rate_holder["rate"] = rate
+                yield pcm
+        ok = await satellites.send_reply(source, _pcm_iter(),
+                                         source_rate=rate_holder.get("rate", 24000))
+        if not ok:
+            sat_registry.remove(source)
 
     try:
         async for sentence in brain.ask_stream(text):
-            emit(sentence)
-        if batch:
+            await emit(sentence)
+        if source == "local" and batch:
             mouth.say_chunk(" ".join(batch), pending)
             pending = []
-        if first:
+        if source == "local" and first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
             signals.static_stop()
             signals.set_state("idle")
+        if source != "local":
+            await satellites.send_stop(source)
     except asyncio.CancelledError:
         try:
             await brain.interrupt()
         except Exception:
             pass
+        if source != "local":
+            await satellites.send_stop(source)
         raise
+    except Exception as e:
+        # A genuine mid-turn failure (not an interrupt). The spec requires
+        # a satellite-bound turn to SAY that something broke -- otherwise
+        # the person in the other room just hears silence forever with no
+        # idea why. (Local turns keep their pre-existing behavior: this
+        # exception type was already unhandled before this feature, and
+        # fixing that is outside this spec's scope.)
+        log(f"[{NAME}] speak_reply failed: {e!r}")
+        if source != "local":
+            try:
+                async def _err_pcm():
+                    for rate, pcm in synth_stream(
+                            "Sorry, something went wrong on my end."):
+                        yield pcm
+                await satellites.send_reply(source, _err_pcm(), source_rate=24000)
+            except Exception:
+                pass
+            await satellites.send_stop(source)
+        else:
+            raise
+    finally:
+        turn_lock.release(source)
 
 
 async def amain():
@@ -721,6 +786,18 @@ async def amain():
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+
+    async def _on_satellite_utterance(conn, pcm):
+        if pcm.size == 0:
+            return
+        text = await loop.run_in_executor(None, transcribe, pcm)
+        if text:
+            await handle(text, source=conn)
+
+    from backtalk.ears import transcribe
+    await satellites.start_server(
+        "0.0.0.0", CFG["wyoming_port"], _on_satellite_utterance, sat_registry)
+    log(f"[backtalk] satellite listener on port {CFG['wyoming_port']}")
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -856,11 +933,17 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None, source="local") -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
         nonlocal speak_task
+        if source != "local" and not turn_lock.try_acquire(source):
+            log(f"[satellites] dropped utterance from {source.name} "
+               f"(turn owned by {turn_lock.current_owner()})")
+            return True
+        if source == "local":
+            turn_lock.try_acquire("local")  # always succeeds; may steal from a satellite
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
@@ -908,6 +991,9 @@ async def amain():
             _deny_pending()          # an ask never outlives its turn
             speak_task.cancel()
             mouth.shut_up()
+            prev_owner = turn_lock.current_owner()
+            if prev_owner not in ("local", None) and prev_owner != source:
+                await satellites.send_stop(prev_owner)
         if speak_task:
             # Let the cancellation fully land (its brain.interrupt()
             # included) BEFORE anything else touches the brain —
@@ -933,7 +1019,8 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(
+            speak_reply(brain, mouth, text, source=source))
         return True
 
     try:
