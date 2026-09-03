@@ -27,6 +27,8 @@ queued — matching the firmware's own "drop, return to idle, never block"
 principle on its side (jarvis-satellite/main/wyoming_client.c).
 """
 import asyncio
+import json
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -84,6 +86,81 @@ def resample_pcm(pcm: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
     return np.clip(resampled, -32768, 32767).astype(np.int16)
 
 
+@dataclass
+class SatelliteConnection:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    name: str
+    _buffer: bytearray = field(default_factory=bytearray)
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+
+async def _read_message(reader: asyncio.StreamReader) -> dict | None:
+    """One Wyoming JSON line -> dict, or None on a clean EOF/disconnect.
+    A malformed line is logged and skipped (returns an empty dict, which
+    callers treat as a no-op) rather than tearing down the connection --
+    Wyoming is a simple line protocol and one bad message shouldn't be
+    fatal."""
+    line = await reader.readline()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log(f"[satellites] malformed message, skipping: {e}")
+        return {}
+
+
+async def handle_connection(reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter,
+                            on_utterance) -> SatelliteConnection:
+    """Runs for the life of one satellite's TCP connection. Parses
+    inbound audio-start/audio-chunk/audio-stop, and calls on_utterance
+    once per completed utterance. Returns the SatelliteConnection so the
+    caller (start_server, Task 4) can register/unregister it."""
+    peer = writer.get_extra_info("peername")
+    name = f"{peer[0]}:{peer[1]}" if peer else "unknown"
+    conn = SatelliteConnection(reader=reader, writer=writer, name=name)
+    log(f"[satellites] {name} connected")
+    try:
+        while True:
+            msg = await _read_message(reader)
+            if msg is None:
+                break
+            msg_type = msg.get("type")
+            if msg_type == "detect":
+                names = (msg.get("data") or {}).get("names")
+                log(f"[satellites] {name} detect: {names}")
+            elif msg_type == "audio-start":
+                conn._buffer = bytearray()
+            elif msg_type == "audio-chunk":
+                payload_len = int((msg.get("payload_length")) or 0)
+                payload = await reader.readexactly(payload_len) if payload_len else b""
+                conn._buffer.extend(payload)
+            elif msg_type == "audio-stop":
+                pcm = np.frombuffer(bytes(conn._buffer), dtype=np.int16)
+                conn._buffer = bytearray()
+                await on_utterance(conn, pcm)
+            # unknown message types are silently ignored -- forward
+            # compatible with future Wyoming message types this listener
+            # doesn't need to act on
+    except (asyncio.IncompleteReadError, ConnectionResetError) as e:
+        log(f"[satellites] {name} disconnected mid-stream: {e}")
+    finally:
+        conn._buffer = bytearray()  # discard any partial utterance
+        try:
+            writer.close()
+        except Exception:
+            pass
+        log(f"[satellites] {name} connection closed")
+    return conn
+
+
 if __name__ == "__main__":
     # Manual self-test, same convention as ears.py/mouth.py's own
     # __main__ blocks -- this project has no test framework.
@@ -110,3 +187,39 @@ if __name__ == "__main__":
     same = resample_pcm(tone, 24000, 24000)
     assert np.array_equal(same, tone), "same-rate resample must be a no-op"
     print("[satellites] resample_pcm self-test: PASS")
+
+    async def _test_inbound_parsing():
+        import io
+
+        received = []
+
+        async def fake_on_utterance(conn, pcm):
+            received.append((conn.name, pcm))
+
+        # Build a fake Wyoming stream: audio-start, one 4-sample chunk,
+        # audio-stop -- exactly what handle_connection must parse.
+        chunk_pcm = np.array([100, -100, 200, -200], dtype=np.int16)
+        wire = (
+            b'{"type": "audio-start", "data": {"rate": 16000, "width": 2, "channels": 1}}\n'
+            + ('{"type": "audio-chunk", "data": {"rate": 16000, "width": 2, "channels": 1}, "payload_length": %d}\n' % (chunk_pcm.nbytes)).encode()
+            + chunk_pcm.tobytes()
+            + b'{"type": "audio-stop"}\n'
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(wire)
+        reader.feed_eof()
+
+        class _FakeWriter:
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 12345)
+            def close(self):
+                pass
+
+        await handle_connection(reader, _FakeWriter(), fake_on_utterance)
+        assert len(received) == 1, f"expected 1 utterance, got {len(received)}"
+        name, pcm = received[0]
+        assert name == "127.0.0.1:12345"
+        assert np.array_equal(pcm, chunk_pcm), "parsed PCM must match what was sent"
+        print("[satellites] handle_connection self-test: PASS")
+
+    asyncio.run(_test_inbound_parsing())
