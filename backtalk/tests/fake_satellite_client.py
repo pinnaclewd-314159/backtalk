@@ -14,10 +14,13 @@ Design: docs/superpowers/specs/2026-09-03-wyoming-listener-design.md,
 "Testing" section, layer 1.
 
 Two modes:
-  python -m tests.fake_satellite_client
-      Sends one real synthesized utterance ("what is two plus two"),
-      via backtalk's own Kokoro TTS round-tripped through itself -- no
-      external audio file needed -- and prints the reply's framing.
+  python -m tests.fake_satellite_client [words of a question]
+      Sends one real synthesized utterance (default: "what is two plus
+      two"), via backtalk's own Kokoro TTS round-tripped through itself
+      -- no external audio file needed -- and checks the reply's framing
+      is exactly ONE audio-start ... chunks ... audio-stop envelope.
+      Passing a question that provokes several sentences is the sharpest
+      way to see that: the framing must not change with sentence count.
   python -m tests.fake_satellite_client --turnlock-test
       Opens TWO connections, triggers an utterance on both at nearly the
       same instant, and verifies exactly one of them gets a reply while
@@ -64,42 +67,77 @@ async def _send_utterance(writer: asyncio.StreamWriter, pcm: np.ndarray):
     await writer.drain()
 
 
-async def _read_reply(reader: asyncio.StreamReader, timeout: float = 60.0) -> int:
-    """Reads until audio-stop or timeout; returns total reply bytes
-    received (0 means no reply arrived -- the "dropped" case)."""
-    total = 0
+async def _read_reply(reader: asyncio.StreamReader, timeout: float = 60.0,
+                      grace: float = 2.0) -> tuple[int, int, int]:
+    """Reads the WHOLE reply, not just up to the first audio-stop, and
+    returns (total_payload_bytes, audio_start_count, audio_stop_count).
+
+    Reading only until the first audio-stop is what let a real framing
+    bug pass this test: backtalk used to open a fresh
+    audio-start/audio-stop envelope per SENTENCE, so a stop-and-return
+    reader saw a correct-looking reply that was actually just sentence
+    one. The spec's contract is ONE envelope per reply, so this keeps
+    reading for `grace` seconds after the first audio-stop -- anything
+    that arrives in that window is a second envelope and a failure.
+
+    (0, 0, 0) means no reply arrived at all -- the "dropped" case."""
+    total = starts = stops = 0
     try:
         async with asyncio.timeout(timeout):
-            line = await reader.readline()
-            if not line.startswith(b'{"type": "audio-start"'):
-                return 0
             while True:
-                line = await reader.readline()
+                if stops:
+                    # the reply claims to be over: only wait a moment to
+                    # catch a second envelope trailing behind it
+                    try:
+                        async with asyncio.timeout(grace):
+                            line = await reader.readline()
+                    except (TimeoutError, asyncio.TimeoutError):
+                        break
+                else:
+                    line = await reader.readline()
                 if not line:
                     break
-                msg = json.loads(line)
-                if msg.get("type") == "audio-stop":
-                    break
-                if msg.get("type") == "audio-chunk":
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                kind = msg.get("type")
+                if kind == "audio-start":
+                    starts += 1
+                elif kind == "audio-stop":
+                    stops += 1
+                elif kind == "audio-chunk":
                     plen = msg["payload_length"]
                     await reader.readexactly(plen)
                     total += plen
     except (TimeoutError, asyncio.TimeoutError):
         pass
-    return total
+    return total, starts, stops
+
+
+def _shape(total: int, starts: int, stops: int) -> str:
+    return f"{starts} audio-start / {stops} audio-stop / {total} bytes"
 
 
 async def basic_test():
-    pcm = _tts_to_pcm16k("what is two plus two")
+    prompt = " ".join(sys.argv[1:]).strip() or "what is two plus two"
+    pcm = _tts_to_pcm16k(prompt)
     reader, writer = await asyncio.open_connection(HOST, PORT)
     await _send_utterance(writer, pcm)
-    total = await _read_reply(reader)
+    total, starts, stops = await _read_reply(reader)
     writer.close()
-    if total > 0:
-        print(f"[fake_satellite] PASS: got a reply, {total} bytes of 16kHz PCM")
-    else:
-        print("[fake_satellite] FAIL: no reply received")
+    if total <= 0:
+        print(f"[fake_satellite] FAIL: no reply received ({_shape(total, starts, stops)})")
         sys.exit(1)
+    # ONE envelope for the whole reply, however many sentences it has.
+    if starts != 1 or stops != 1:
+        print(f"[fake_satellite] FAIL: framing — expected exactly one "
+              f"audio-start ... chunks ... audio-stop, got "
+              f"{_shape(total, starts, stops)}")
+        sys.exit(1)
+    secs = total / (WIRE_RATE * 2)
+    print(f"[fake_satellite] PASS: got a reply, {total} bytes of 16kHz PCM "
+          f"({secs:.2f}s), framing OK ({_shape(total, starts, stops)})")
 
 
 async def turnlock_test():
@@ -110,15 +148,18 @@ async def turnlock_test():
     await asyncio.sleep(0.3)  # let A's turn actually start before B tries
     await _send_utterance(writer_b, _tts_to_pcm16k("hello"))
 
-    total_a = await _read_reply(reader_a)
-    total_b = await _read_reply(reader_b, timeout=5.0)
+    total_a, starts_a, stops_a = await _read_reply(reader_a)
+    total_b, starts_b, stops_b = await _read_reply(reader_b, timeout=5.0)
     writer_a.close()
     writer_b.close()
 
-    if total_a > 0 and total_b == 0:
-        print("[fake_satellite] PASS: A got a reply, B was correctly dropped")
+    if total_a > 0 and starts_a == 1 and stops_a == 1 and total_b == 0 and starts_b == 0:
+        print(f"[fake_satellite] PASS: A got a reply "
+              f"({_shape(total_a, starts_a, stops_a)}), B was correctly dropped")
     else:
-        print(f"[fake_satellite] FAIL: expected A>0,B==0, got A={total_a},B={total_b}")
+        print(f"[fake_satellite] FAIL: expected A = one envelope with audio, "
+              f"B = nothing; got A={_shape(total_a, starts_a, stops_a)}, "
+              f"B={_shape(total_b, starts_b, stops_b)}")
         sys.exit(1)
 
 

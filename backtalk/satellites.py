@@ -27,6 +27,7 @@ queued — matching the firmware's own "drop, return to idle, never block"
 principle on its side (jarvis-satellite/main/wyoming_client.c).
 """
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass, field
 
@@ -35,6 +36,15 @@ import numpy as np
 from backtalk.vlog import log
 
 WIRE_RATE = 16000  # satellite mic/speaker rate, fixed by the firmware
+
+# Wire-robustness ceilings. This listener binds 0.0.0.0 with no auth (the
+# spec's trust model), so a single broken peer -- a firmware glitch is
+# enough, no attacker required -- must never be able to make this process
+# allocate without bound. Both caps are generous for any real utterance:
+# a satellite chunk is a few kB, and 60s is far longer than the firmware's
+# own capture window.
+MAX_CHUNK_BYTES = 1024 * 1024              # 1 MB per audio-chunk payload
+MAX_UTTERANCE_BYTES = 60 * WIRE_RATE * 2   # 60s of 16kHz mono int16 (~1.92 MB)
 
 
 class TurnLock:
@@ -92,6 +102,9 @@ class SatelliteConnection:
     writer: asyncio.StreamWriter
     name: str
     _buffer: bytearray = field(default_factory=bytearray)
+    # True once this utterance blew a wire-robustness ceiling: the rest of
+    # it is discarded (and never transcribed) until the next audio-start.
+    _dropping: bool = False
 
     def __hash__(self):
         return id(self)
@@ -99,33 +112,71 @@ class SatelliteConnection:
     def __eq__(self, other):
         return self is other
 
+    def __repr__(self):
+        # NEVER the dataclass default: that renders _buffer, which is raw
+        # microphone PCM, straight into any log line that interpolates a
+        # connection.
+        return f"<SatelliteConnection {self.name}>"
+
 
 async def _read_message(reader: asyncio.StreamReader) -> dict | None:
     """One Wyoming JSON line -> dict, or None on a clean EOF/disconnect.
     A malformed line is logged and skipped (returns an empty dict, which
     callers treat as a no-op) rather than tearing down the connection --
     Wyoming is a simple line protocol and one bad message shouldn't be
-    fatal."""
-    line = await reader.readline()
+    fatal. That covers three separate ways a line can be bad: unparsable
+    bytes, a line longer than the stream reader's own limit (readline
+    raises ValueError and drops it, so the next readline resyncs), and
+    VALID json that isn't an object at all (a bare number or list --
+    msg.get() on one of those would raise AttributeError up in the
+    parser, outside its own malformed-message handling, and tear the
+    connection down)."""
+    try:
+        line = await reader.readline()
+    except ValueError as e:      # line longer than the reader's limit
+        log(f"[satellites] over-length message, skipping: {e}")
+        return {}
     if not line:
         return None
     try:
-        return json.loads(line)
+        msg = json.loads(line)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         log(f"[satellites] malformed message, skipping: {e}")
         return {}
+    if not isinstance(msg, dict):
+        log(f"[satellites] malformed message (not a json object), "
+            f"skipping: {type(msg).__name__}")
+        return {}
+    return msg
+
+
+def make_connection(reader: asyncio.StreamReader,
+                    writer: asyncio.StreamWriter) -> SatelliteConnection:
+    """One accepted socket -> its SatelliteConnection, named for its peer.
+
+    Split out of handle_connection so start_server can build (and
+    register) the connection at ACCEPT time -- the spec's data flow says
+    "satellite connects; registered in the connection dict", and a
+    disconnect that happens before the satellite's first utterance has to
+    be reportable too."""
+    peer = writer.get_extra_info("peername")
+    name = f"{peer[0]}:{peer[1]}" if peer else "unknown"
+    return SatelliteConnection(reader=reader, writer=writer, name=name)
 
 
 async def handle_connection(reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter,
-                            on_utterance) -> SatelliteConnection:
+                            on_utterance,
+                            conn: SatelliteConnection | None = None
+                            ) -> SatelliteConnection:
     """Runs for the life of one satellite's TCP connection. Parses
     inbound audio-start/audio-chunk/audio-stop, and calls on_utterance
     once per completed utterance. Returns the SatelliteConnection so the
-    caller (start_server, Task 4) can register/unregister it."""
-    peer = writer.get_extra_info("peername")
-    name = f"{peer[0]}:{peer[1]}" if peer else "unknown"
-    conn = SatelliteConnection(reader=reader, writer=writer, name=name)
+    caller (start_server) can register/unregister it; pass `conn` when
+    the caller already built one at accept time."""
+    if conn is None:
+        conn = make_connection(reader, writer)
+    name = conn.name
     log(f"[satellites] {name} connected")
     try:
         while True:
@@ -138,16 +189,41 @@ async def handle_connection(reader: asyncio.StreamReader,
                 log(f"[satellites] {name} detect: {names}")
             elif msg_type == "audio-start":
                 conn._buffer = bytearray()
+                conn._dropping = False
             elif msg_type == "audio-chunk":
                 try:
                     payload_len = int((msg.get("payload_length")) or 0)
+                    if payload_len > MAX_CHUNK_BYTES:
+                        # Refuse to allocate it, and don't read it either:
+                        # a length this wrong means the peer is broken, and
+                        # readline resyncs on the next newline. Same
+                        # log-and-skip contract as any malformed message.
+                        raise ValueError(
+                            f"payload_length {payload_len} over the "
+                            f"{MAX_CHUNK_BYTES}-byte chunk ceiling")
                     payload = await reader.readexactly(payload_len) if payload_len else b""
                 except (ValueError, TypeError) as e:
                     log(f"[satellites] {name} malformed message (skipped): {e}")
                     conn._buffer = bytearray()  # discard any partial utterance
+                    conn._dropping = True
+                    continue
+                if conn._dropping:
+                    continue     # payload read (stream stays in sync), discarded
+                if len(conn._buffer) + len(payload) > MAX_UTTERANCE_BYTES:
+                    log(f"[satellites] {name} utterance over the "
+                        f"{MAX_UTTERANCE_BYTES}-byte ceiling (no audio-stop?) "
+                        f"-- discarding it, connection stays open")
+                    conn._buffer = bytearray()
+                    conn._dropping = True
                     continue
                 conn._buffer.extend(payload)
             elif msg_type == "audio-stop":
+                if conn._dropping:
+                    # this utterance already blew a ceiling: it is partial
+                    # garbage, so it is discarded rather than transcribed
+                    conn._buffer = bytearray()
+                    conn._dropping = False
+                    continue
                 try:
                     pcm = np.frombuffer(bytes(conn._buffer), dtype=np.int16)
                 except ValueError as e:
@@ -165,6 +241,7 @@ async def handle_connection(reader: asyncio.StreamReader,
         log(f"[satellites] {name} disconnected mid-stream: {e}")
     finally:
         conn._buffer = bytearray()  # discard any partial utterance
+        conn._dropping = False
         try:
             writer.close()
         except Exception:
@@ -173,16 +250,27 @@ async def handle_connection(reader: asyncio.StreamReader,
     return conn
 
 
-async def send_reply(conn: SatelliteConnection, pcm_chunks, source_rate: int) -> bool:
-    """Streams one reply to a satellite as audio-start / audio-chunk(s) /
-    audio-stop, resampling each chunk from source_rate (Kokoro=24000,
-    ElevenLabs=44100) down to the satellite's fixed WIRE_RATE. pcm_chunks
-    may be a plain iterable or an async iterable of int16 np.ndarrays.
+async def send_reply(conn: SatelliteConnection, rated_pcm_chunks) -> bool:
+    """Streams ONE WHOLE REPLY to a satellite as exactly one envelope:
+    audio-start, then an audio-chunk per PCM chunk, then one audio-stop
+    when the reply is done (the spec's wire format -- one envelope per
+    reply, however many sentences it contains, so this must be called
+    once per turn and never once per sentence).
 
-    Returns False on any write failure -- the caller (Task 6) must stop
-    synthesizing further sentences and clean the connection out of the
-    registry when this happens, per the spec: "one satellite's failure
-    never takes the shared backtalk process down."
+    `rated_pcm_chunks` is an iterable OR async iterable of
+    `(sample_rate, pcm)` tuples -- exactly the shape
+    mouth.synth_stream() already yields, so the caller can hand its
+    generator straight through. Each chunk is resampled from ITS OWN
+    rate (Kokoro=24000, ElevenLabs=44100) down to the satellite's fixed
+    WIRE_RATE; carrying the rate per chunk is what makes a mid-reply
+    engine fallback correct, and removes any need for the caller to know
+    the rate before synthesis has started.
+
+    Returns False on any write failure -- the caller (main.py's
+    speak_reply, Task 5) must stop synthesizing further sentences and
+    clean the connection out of the registry when this happens, per the
+    spec: "one satellite's failure never takes the shared backtalk
+    process down."
     """
     try:
         conn.writer.write(
@@ -191,14 +279,14 @@ async def send_reply(conn: SatelliteConnection, pcm_chunks, source_rate: int) ->
         await conn.writer.drain()
 
         async def _chunks():
-            if hasattr(pcm_chunks, "__aiter__"):
-                async for c in pcm_chunks:
+            if hasattr(rated_pcm_chunks, "__aiter__"):
+                async for c in rated_pcm_chunks:
                     yield c
             else:
-                for c in pcm_chunks:
+                for c in rated_pcm_chunks:
                     yield c
 
-        async for pcm in _chunks():
+        async for source_rate, pcm in _chunks():
             resampled = resample_pcm(pcm, source_rate, WIRE_RATE)
             if resampled.size == 0:
                 continue
@@ -242,25 +330,40 @@ class SatelliteRegistry:
 
 
 async def start_server(host: str, port: int, on_utterance,
-                       registry: SatelliteRegistry):
+                       registry: SatelliteRegistry, on_disconnect=None):
     """Binds the Wyoming TCP listener. Each accepted connection runs
     handle_connection() as its own task; the registry is updated on
-    connect/disconnect so main.py's turn-lock interrupt logic (Task 6)
-    can find and message any connected satellite."""
+    connect/disconnect so main.py's turn-lock interrupt logic (Task 5)
+    can find and message any connected satellite.
+
+    A connection is registered at ACCEPT time, not at its first
+    utterance -- that's what the spec's data flow says ("satellite
+    connects; registered in the connection dict"), and it's what makes a
+    drop before the first utterance visible at all.
+
+    `on_disconnect`, when given, is called with the SatelliteConnection
+    once its connection has torn down, for any reason. It may be sync or
+    async. This module stays self-contained -- it knows nothing about
+    turn locks -- so main.py uses this hook to cancel a turn whose owner
+    just vanished (spec: "a dropped connection ... cancels that turn and
+    clears the owner, same as any other interrupt"). Its exceptions are
+    logged and swallowed: a callback bug must not take the listener down.
+    """
 
     async def _on_client(reader, writer):
-        conn_ref = [None]  # populated once the first utterance names the connection
-
-        async def _wrapped_on_utterance(conn, pcm):
-            conn_ref[0] = conn
-            registry.add(conn)
-            await on_utterance(conn, pcm)
-
+        conn = make_connection(reader, writer)
+        registry.add(conn)
         try:
-            await handle_connection(reader, writer, _wrapped_on_utterance)
+            await handle_connection(reader, writer, on_utterance, conn=conn)
         finally:
-            if conn_ref[0] is not None:
-                registry.remove(conn_ref[0])
+            registry.remove(conn)
+            if on_disconnect is not None:
+                try:
+                    result = on_disconnect(conn)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as e:
+                    log(f"[satellites] {conn.name} on_disconnect failed: {e!r}")
 
     server = await asyncio.start_server(_on_client, host, port)
     log(f"[satellites] Wyoming listener on {host}:{port}")
@@ -427,12 +530,35 @@ if __name__ == "__main__":
 
         conn = SatelliteConnection(reader=None, writer=_FakeWriter(), name="test")
         tone = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 10000).astype(np.int16)
-        ok = await send_reply(conn, [tone], source_rate=24000)
+        # Several chunks at DIFFERENT rates in one call: one envelope out,
+        # and each chunk resampled from its own tuple's rate -- the whole
+        # point of the (rate, pcm) contract.
+        el_tone = (np.sin(2 * np.pi * 440 * np.arange(4410) / 44100) * 10000).astype(np.int16)
+        ok = await send_reply(conn, [(24000, tone), (44100, el_tone)])
         assert ok is True
         text = bytes(written)
         assert text.startswith(b'{"type": "audio-start"'), "must start with audio-start"
         assert b'"type": "audio-chunk"' in text, "must contain an audio-chunk"
         assert text.rstrip().endswith(b'{"type": "audio-stop"}'), "must end with audio-stop"
+        # Parse the wire for real (payload bytes can contain newlines, so
+        # a naive split/count would lie).
+        types, lens, pos = [], [], 0
+        while pos < len(text):
+            nl = text.find(b"\n", pos)
+            if nl < 0:
+                break
+            msg = json.loads(text[pos:nl])
+            pos = nl + 1
+            types.append(msg.get("type"))
+            if msg.get("type") == "audio-chunk":
+                lens.append(msg["payload_length"])
+                pos += msg["payload_length"]
+        assert types.count("audio-start") == 1, f"exactly ONE audio-start: {types}"
+        assert types.count("audio-stop") == 1, f"exactly ONE audio-stop: {types}"
+        assert types == ["audio-start", "audio-chunk", "audio-chunk",
+                         "audio-stop"], f"one envelope per reply, got {types}"
+        # 2400 @24k -> 1600 @16k (3200 bytes); 4410 @44.1k -> 1600 @16k (3200 bytes)
+        assert lens == [3200, 3200], f"per-chunk rate must be honoured, got {lens}"
         print("[satellites] send_reply self-test: PASS")
 
     asyncio.run(_test_outbound_reply())
@@ -462,7 +588,7 @@ if __name__ == "__main__":
 
         conn = SatelliteConnection(reader=None, writer=_FakeWriterWithFailure(), name="test")
         tone = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 10000).astype(np.int16)
-        ok = await send_reply(conn, [tone], source_rate=24000)
+        ok = await send_reply(conn, [(24000, tone)])
         assert ok is False, "send_reply must return False on write failure"
         print("[satellites] send_reply write-failure self-test: PASS")
 
@@ -522,9 +648,15 @@ if __name__ == "__main__":
 
         async def on_utterance(conn, pcm):
             got.append(pcm)
-            await send_reply(conn, [pcm], source_rate=WIRE_RATE)
+            await send_reply(conn, [(WIRE_RATE, pcm)])
 
-        server = await start_server("127.0.0.1", 17700, on_utterance, registry)
+        dropped = []
+
+        async def on_disconnect(conn):
+            dropped.append(conn)
+
+        server = await start_server("127.0.0.1", 17700, on_utterance, registry,
+                                    on_disconnect=on_disconnect)
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", 17700)
             tone = (np.sin(2 * np.pi * 440 * np.arange(320) / 16000) * 5000).astype(np.int16)
@@ -546,13 +678,117 @@ if __name__ == "__main__":
             stop_line = await reader.readline()
             assert stop_line.startswith(b'{"type": "audio-stop"'), stop_line
 
+            assert len(registry.connections) == 1, \
+                "the connection must be registered at ACCEPT time"
+
             writer.close()
             await asyncio.sleep(0.1)  # let the server-side handler unwind
             assert len(got) == 1
             assert np.array_equal(got[0], tone)
+            assert len(dropped) == 1, "on_disconnect must fire on teardown"
+            assert not registry.connections, "registry must be empty again"
             print("[satellites] start_server round-trip self-test: PASS")
         finally:
             server.close()
             await server.wait_closed()
 
     asyncio.run(_test_server_roundtrip())
+
+    async def _test_disconnect_before_any_utterance():
+        """A satellite that connects and drops WITHOUT ever speaking must
+        still be registered and still fire on_disconnect -- the whole point
+        of registering at accept time."""
+        registry = SatelliteRegistry()
+        dropped = []
+        seen_registered = []
+
+        async def on_utterance(conn, pcm):
+            pass
+
+        def on_disconnect(conn):          # sync callback, deliberately
+            dropped.append(conn)
+
+        server = await start_server("127.0.0.1", 17701, on_utterance, registry,
+                                    on_disconnect=on_disconnect)
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", 17701)
+            await asyncio.sleep(0.1)
+            seen_registered.append(len(registry.connections))
+            writer.close()
+            await asyncio.sleep(0.1)
+            assert seen_registered == [1], \
+                f"connect-time registration expected, got {seen_registered}"
+            assert len(dropped) == 1, "on_disconnect must fire with no utterance"
+            assert not registry.connections
+            print("[satellites] connect-time registration / on_disconnect "
+                  "self-test: PASS")
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(_test_disconnect_before_any_utterance())
+
+    async def _test_wire_robustness_caps():
+        """A broken peer must never make this process allocate without
+        bound: an over-size payload_length is refused (and never read),
+        an unbounded run of audio-chunks with no audio-stop is capped,
+        a non-dict json line is skipped, and the connection survives all
+        three."""
+        received = []
+
+        async def fake_on_utterance(conn, pcm):
+            received.append(pcm)
+
+        class _FakeWriter:
+            def get_extra_info(self, _):
+                return ("127.0.0.1", 12348)
+            def close(self):
+                pass
+
+        good = np.array([1, 2, 3, 4], dtype=np.int16)
+        # a "chunk" claiming 4 GB, a bare-number json line, then a real
+        # utterance -- the connection must still be parsing normally.
+        wire = (
+            b'{"type": "audio-start", "data": {"rate": 16000}}\n'
+            + b'{"type": "audio-chunk", "payload_length": 4294967296}\n'
+            + b'42\n'
+            + b'["not", "an", "object"]\n'
+            + b'{"type": "audio-start", "data": {"rate": 16000}}\n'
+            + ('{"type": "audio-chunk", "payload_length": %d}\n' % good.nbytes).encode()
+            + good.tobytes()
+            + b'{"type": "audio-stop"}\n'
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(wire)
+        reader.feed_eof()
+        await handle_connection(reader, _FakeWriter(), fake_on_utterance)
+        assert len(received) == 1, f"expected 1 utterance, got {len(received)}"
+        assert np.array_equal(received[0], good)
+
+        # Now the total-buffer ceiling: chunks that never stop.
+        received.clear()
+        blob = np.zeros(200_000, dtype=np.int16)   # 400 kB per chunk
+        header = ('{"type": "audio-chunk", "payload_length": %d}\n'
+                  % blob.nbytes).encode()
+        wire = b'{"type": "audio-start", "data": {"rate": 16000}}\n'
+        for _ in range(12):                        # 4.8 MB, well over the cap
+            wire += header + blob.tobytes()
+        wire += b'{"type": "audio-stop"}\n'
+        # ...and a clean utterance afterwards, proving it stayed open.
+        wire += (b'{"type": "audio-start", "data": {"rate": 16000}}\n'
+                 + ('{"type": "audio-chunk", "payload_length": %d}\n' % good.nbytes).encode()
+                 + good.tobytes()
+                 + b'{"type": "audio-stop"}\n')
+        reader = asyncio.StreamReader(limit=8 * 1024 * 1024)
+        reader.feed_data(wire)
+        reader.feed_eof()
+        w = _FakeWriter()
+        conn = SatelliteConnection(reader=reader, writer=w, name="cap-test")
+        await handle_connection(reader, w, fake_on_utterance, conn=conn)
+        assert len(received) == 1, \
+            f"the over-cap utterance must be dropped, not transcribed: {len(received)}"
+        assert np.array_equal(received[0], good), "the later clean utterance must parse"
+        assert len(conn._buffer) == 0, "the buffer must not survive the connection"
+        print("[satellites] wire-robustness caps self-test: PASS")
+
+    asyncio.run(_test_wire_robustness_caps())
