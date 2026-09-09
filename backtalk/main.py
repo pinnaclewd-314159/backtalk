@@ -69,10 +69,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "tools"))
 import cross_channel_log  # noqa: E402
 
+from backtalk import connectivity
 from backtalk import satellites
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
+from backtalk.local_brain import LocalBrain
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
 from backtalk.mouth import Mouth
@@ -185,6 +187,10 @@ def _human_what(tool, tool_input, ctx):
         url = str(d.get("url", ""))
         host = url.split("//", 1)[-1].split("/", 1)[0] or "a site"
         return f"read a web page at {host}"
+    if tool == "HAServiceCall":
+        verb = {"turn_on": "turn on", "turn_off": "turn off"}.get(
+            d.get("service", ""), d.get("service", "control"))
+        return f"{verb} {d.get('entity_id', 'a device')}"
     name = getattr(ctx, "display_name", None) or tool
     return f"use the {name} tool"
 
@@ -218,6 +224,10 @@ def _full_detail(tool, tool_input, ctx):
         return f"{'edit' if 'Edit' in tool else 'write'} the file {name}"
     if tool == "WebFetch":
         return f"fetch a web page: {str(d.get('url', ''))[:70]}"
+    if tool == "HAServiceCall":
+        extra = f" with {d.get('data')}" if d.get("data") else ""
+        return (f"call Home Assistant service {d.get('domain')}."
+                f"{d.get('service')} on {d.get('entity_id')}{extra}")
     desc = (getattr(ctx, "description", None) or "").strip()
     name = getattr(ctx, "display_name", None) or tool
     return f"use {name}" + (f", {desc[:70]}" if desc else "")
@@ -684,9 +694,17 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
                 pending = []
                 batch = []
 
+    is_cloud = isinstance(brain, WarmBrain)
     try:
-        async for sentence in brain.ask_stream(text):
-            emit(sentence)
+        try:
+            async for sentence in brain.ask_stream(text):
+                emit(sentence)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if is_cloud:
+                connectivity.force_offline()
+            raise
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
             pending = []
@@ -770,6 +788,8 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
             # audio-stop. (If the socket is what died, send_reply has
             # already closed this generator and none of this runs.)
             log(f"[{NAME}] speak_reply failed: {e!r}")
+            if isinstance(brain, WarmBrain):
+                connectivity.force_offline()
             try:
                 for rate, pcm in synth_stream(
                         "Sorry, something went wrong on my end."):
@@ -834,9 +854,28 @@ async def amain():
 
     mouth = Mouth()
     ears = Ears(silence_ms=CFG.get("silence_ms", 480))
-    brain = WarmBrain(model=model,
-                      can_use_tool=make_permission_gate(mouth),
+    perm_gate = make_permission_gate(mouth)
+    brain = WarmBrain(model=model, can_use_tool=perm_gate,
                       resume_id=resume_id)
+    lf_cfg = CFG.get("local_fallback", {})
+    local_brain = LocalBrain(can_use_tool=perm_gate,
+                              base_url=lf_cfg.get("base_url",
+                                                  "http://127.0.0.1:8712"))
+
+    async def _on_connectivity_change(online: bool):
+        if online:
+            mouth.say("Sir, connectivity's back, I'm reconnected.")
+            try:
+                await brain.start()
+            except Exception as e:
+                log(f"[backtalk] brain reconnect failed: {e!r}")
+        else:
+            mouth.say("Sir, I've lost connectivity — falling back to "
+                      "local device control only.")
+            try:
+                await brain.stop()
+            except Exception:
+                pass
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -857,6 +896,7 @@ async def amain():
     # case: the greeting played, then nothing, and on Windows the
     # window closed before anyone could read the error).
     log("[backtalk] connecting the brain...")
+    booted_offline = False
     try:
         await asyncio.wait_for(brain.start(), 120)
 
@@ -869,24 +909,40 @@ async def amain():
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
         log(f"[backtalk] BRAIN CONNECT {kind}")
-        mouth.say("Bad news. The voice and the face are fine, but I "
-                  "couldn't reach my brain, the Claude Code session. "
-                  "Check this window for the error. The usual causes: "
-                  "Claude Code isn't signed in, the internet is down, "
-                  "or the plan is out of usage.")
-        mouth.wait_done(timeout=30)
-        raise SystemExit(1)
-    log("[backtalk] brain warm")
-    # the hidden warmup ping is plumbing, not conversation
-    brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
-    # a configured effort level applies at launch (saved by the spoken
-    # "set effort to X", or written by the person's agent on request)
-    boot_effort = str(CFG.get("effort") or "").strip().lower()
-    if boot_effort in _EFFORTS:
-        await brain.command(f"/effort {boot_effort}")
-        log(f"[backtalk] effort set to {boot_effort} (from config)")
-    elif boot_effort:
-        log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
+        if not lf_cfg.get("enabled"):
+            mouth.say("Bad news. The voice and the face are fine, but I "
+                      "couldn't reach my brain, the Claude Code session. "
+                      "Check this window for the error. The usual causes: "
+                      "Claude Code isn't signed in, the internet is down, "
+                      "or the plan is out of usage.")
+            mouth.wait_done(timeout=30)
+            raise SystemExit(1)
+        # Local fallback is enabled: don't die on a cold boot during an
+        # outage — start in offline mode. connectivity.start() below is
+        # told the real initial state directly (no on_change fired for
+        # it), so this doesn't double up with the poll loop's own
+        # detection.
+        booted_offline = True
+        mouth.say("I couldn't reach my brain at startup, so I'm "
+                  "starting in local device-control mode until the "
+                  "connection's back.")
+    if lf_cfg.get("enabled"):
+        connectivity.start(
+            lf_cfg.get("health_check_url", "https://api.anthropic.com"),
+            on_change=_on_connectivity_change,
+            interval_s=lf_cfg.get("poll_interval_s", 20.0),
+            timeout_s=lf_cfg.get("poll_timeout_s", 4.0),
+            threshold=lf_cfg.get("poll_threshold", 2),
+            initial_online=not booted_offline)
+    if not booted_offline:
+        log("[backtalk] brain warm")
+        brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
+        boot_effort = str(CFG.get("effort") or "").strip().lower()
+        if boot_effort in _EFFORTS:
+            await brain.command(f"/effort {boot_effort}")
+            log(f"[backtalk] effort set to {boot_effort} (from config)")
+        elif boot_effort:
+            log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
     speak_task: asyncio.Task | None = None
     # The turn-lock epoch of the CURRENT turn — set by handle() the moment
@@ -950,6 +1006,11 @@ async def amain():
             signals.set_state("idle")
 
     async def _run_console_inner(verb):
+        if (not connectivity.is_online()
+                and (verb in ("clear", "compact", "deep", "fast", "usage")
+                     or verb.startswith("effort:"))):
+            mouth.say("That's not available while we're offline.")
+            return
         _deny_pending()
         await brain.reset_turn()
         say_after = None
@@ -1182,7 +1243,9 @@ async def amain():
             # that fired in the meantime resolves first, or the drain would
             # wait on a ResultMessage the CLI is withholding for an answer.
             _deny_pending()
-            await brain.reset_turn()
+            active_brain = brain if connectivity.is_online() else local_brain
+            if active_brain is brain:
+                await brain.reset_turn()
             # Cross-channel catch-up (local/house voice only — see
             # backtalk/docs/superpowers/specs/
             # 2026-09-08-cross-channel-memory-design.md): fold in
@@ -1208,7 +1271,7 @@ async def amain():
                         f"Telegram:\n{catch_up}\n---]\n{text}")
                 cross_channel_log.append_turn("voice", "user", text)
             speak_task = asyncio.create_task(
-                speak_reply(brain, mouth, brain_text, source=source,
+                speak_reply(active_brain, mouth, brain_text, source=source,
                             epoch=epoch, log_channel="voice" if source == "local" else None))
             started_speak = True
             return True
@@ -1339,6 +1402,8 @@ async def amain():
         signals.static_stop()
         signals.set_state("idle")
         await brain.stop()
+        if lf_cfg.get("enabled"):
+            await connectivity.stop()
         log("[backtalk] hung up")
 
 
