@@ -215,6 +215,18 @@ DEFAULTS = {
         "crossfade_ms": 50,
         "normalize": True,
     },
+    # Offline fallback: cloud Claude -> local Qwen3-4B via llama-server,
+    # for Home Assistant control + a short canned-utility list when the
+    # internet is down. See backtalk/docs/superpowers/specs/
+    # 2026-09-09-offline-fallback-design.md.
+    "local_fallback": {
+        "enabled": False,
+        "base_url": "http://127.0.0.1:8712",
+        "health_check_url": "https://api.anthropic.com",
+        "poll_interval_s": 20.0,
+        "poll_timeout_s": 4.0,
+        "poll_threshold": 2,
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
