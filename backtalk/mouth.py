@@ -19,10 +19,14 @@
 long-lived output stream.
 
 Default engine: Kokoro, in-process. Local, free, no server, no API key,
-~0.2s to first audio once warm. Optional premium engine: ElevenLabs on
+~0.2s to first audio once warm. Two optional premium engines, tried in
+order before Kokoro: Voicebox, a local TTS server on this machine (see
+_stream_voicebox — no API key, but not truly incremental: it renders
+the whole clip before the first byte comes back), and ElevenLabs on
 YOUR key — read from the system keychain, never from a file (see
-_get_elevenlabs_key) — with Kokoro as the automatic fallback: the voice
-degrades instead of going mute if the cloud fails.
+_get_elevenlabs_key). Kokoro is the automatic fallback for either one:
+the voice degrades instead of going mute if the server or the cloud
+fails.
 
 Sentences are synthesized one at a time and queued for playback, so the
 first sentence is audible while later ones are still rendering. Playback
@@ -56,9 +60,23 @@ from backtalk.vlog import log
 KOKORO_RATE = 24000
 EL_RATE = 44100
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_MD_HEADER_RE = re.compile(r"(?m)^#{1,6}\s*")
+_MD_BULLET_RE = re.compile(r"(?m)^\s*[-*+]\s+")
 
 _pipe = None
 _pipe_lock = threading.Lock()
+
+
+def _strip_markdown(text: str) -> str:
+    """Voice-session backstop: the model is instructed never to emit
+    markdown in spoken replies, but it slips through occasionally, and
+    the TTS engines read punctuation like asterisks aloud literally
+    (`**word**` -> "asterisk asterisk word asterisk asterisk"). Strip
+    the offenders here so a lapse upstream never reaches the speaker.
+    Applied once in synth_stream(), ahead of every engine."""
+    text = _MD_HEADER_RE.sub("", text)
+    text = _MD_BULLET_RE.sub("", text)
+    return text.replace("*", "").replace("`", "")
 
 
 def _ensure_espeak():
@@ -194,6 +212,55 @@ def _stream_kokoro(text: str):
             yield (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
 
 
+def _stream_voicebox(text: str, timeout: float):
+    """Voicebox's local server -> WAV bytes -> int16 PCM at whatever rate
+    the WAV header actually says (read dynamically — different engines
+    ship different sample rates, e.g. Chatterbox Turbo vs LuxTTS).
+
+    THE VOICEBOX CAVEAT: despite the name, /generate/stream is NOT
+    incremental — the server renders the entire clip before the first
+    byte comes back over HTTP. So there's no early-audio head start the
+    way Kokoro/ElevenLabs give one; first sound waits on full synthesis.
+    Still worth it for voice quality, and still degrades to Kokoro on
+    any failure rather than going mute.
+
+    `engine` is sent explicitly (see config.py's voicebox block for why:
+    the API's own request-model default is "qwen", and that default
+    wins over the profile's own default_engine whenever the field is
+    merely omitted — only an explicit null defers to the profile)."""
+    import io
+    import wave
+
+    import httpx
+
+    vb = CFG["voicebox"]
+    url = f"{vb['base_url'].rstrip('/')}/generate/stream"
+    payload = {
+        "profile_id": vb["profile_id"],
+        "text": text,
+        "engine": vb["engine"],
+        "max_chunk_chars": vb["max_chunk_chars"],
+        "crossfade_ms": vb["crossfade_ms"],
+        "normalize": vb["normalize"],
+    }
+    buf = io.BytesIO()
+    with httpx.stream("POST", url, json=payload, timeout=timeout) as r:
+        r.raise_for_status()
+        for chunk in r.iter_bytes():
+            buf.write(chunk)
+    buf.seek(0)
+    with wave.open(buf, "rb") as w:
+        rate = w.getframerate()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    if pcm.size:
+        yield rate, pcm
+
+
+def _voicebox_ready() -> bool:
+    vb = CFG["voicebox"]
+    return bool(vb.get("enabled") and vb.get("profile_id") and vb.get("engine"))
+
+
 def _stream_elevenlabs(text: str, timeout: float):
     """ElevenLabs -> ffmpeg streaming decode -> int16 PCM at 44.1kHz.
 
@@ -318,9 +385,19 @@ def _elevenlabs_ready() -> bool:
 
 def synth_stream(text: str, timeout: float = 30.0):
     """One sentence -> yields (sample_rate, pcm_chunk) as the TTS
-    renders. ElevenLabs when configured, Kokoro otherwise — and Kokoro
-    as the fallback on ANY ElevenLabs failure. Degrade, never mute."""
-    if _elevenlabs_ready():
+    renders. Voicebox when configured, else ElevenLabs when configured,
+    else Kokoro — and Kokoro as the fallback on ANY failure of either
+    premium engine. Degrade, never mute."""
+    text = _strip_markdown(text)
+    if _voicebox_ready():
+        try:
+            for rate, pcm in _stream_voicebox(text, timeout):
+                yield rate, pcm
+            return
+        except Exception as e:
+            log(f"[mouth] voicebox failed ({str(e)[:60]}) — "
+                f"falling back to {CFG['voice']}")
+    elif _elevenlabs_ready():
         try:
             for pcm in _stream_elevenlabs(text, timeout):
                 yield EL_RATE, pcm

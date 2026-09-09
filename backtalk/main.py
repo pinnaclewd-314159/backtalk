@@ -60,6 +60,14 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
+
+# cross_channel_log lives in tools/, not a backtalk package dependency —
+# it's the shared voice<->Telegram transcript both this process and
+# tools/telegram_bridge.py read/write (see backtalk/docs/superpowers/
+# specs/2026-09-08-cross-channel-memory-design.md).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "tools"))
+import cross_channel_log  # noqa: E402
 
 from backtalk import satellites
 from backtalk import signals
@@ -84,6 +92,10 @@ PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
          "hinted": False}                # escape-hatch hint said yet?
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
+# Last Telegram entry (its own "ts" string) this process has already
+# folded into a voice turn — so the same catch-up isn't re-injected on
+# every single turn once it's been seen once this session.
+_LAST_SEEN_TELEGRAM_TS: str | None = None
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
@@ -591,7 +603,7 @@ def _typed_reader(q: "queue.Queue[str]"):
 
 
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
-                      epoch: int = 0):
+                      epoch: int = 0, log_channel: str | None = None):
     """One turn's reply, routed to whichever mouth asked for it.
 
     Two genuinely different code paths, deliberately NOT threaded
@@ -604,11 +616,18 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
     `epoch` is the turn-lock generation this turn acquired. Releasing
     against it is what stops a turn that has already been superseded —
     including by its OWN source re-triggering, where the owner alone
-    still matches — from clearing the lock its replacement is holding."""
+    still matches — from clearing the lock its replacement is holding.
+
+    `log_channel`, when set (only ever "voice" today), writes this
+    turn's spoken reply to the shared cross-channel transcript — see
+    backtalk/docs/superpowers/specs/2026-09-08-cross-channel-memory-design.md.
+    `text` here may already carry an injected Telegram catch-up prefix
+    (handle() does that); the caller logs the pristine user utterance
+    separately, this only logs the assistant side."""
     try:
         if source == "local":
             try:
-                await _speak_reply_local(brain, mouth, text)
+                await _speak_reply_local(brain, mouth, text, log_channel)
             except Exception as e:
                 # Diagnostics only. This exception was unhandled on the
                 # local path before satellites existed and still is: it
@@ -622,7 +641,8 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
         turn_lock.release(source, epoch)
 
 
-async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str):
+async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
+                              log_channel: str | None = None):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
     short sentences come out flat)."""
@@ -630,6 +650,7 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str):
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
+    spoken: list[str] = []           # everything emitted, for cross_channel_log
 
     def emit(raw: str):
         nonlocal first, batch, pending
@@ -648,6 +669,7 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str):
         s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
             return
+        spoken.append(s)
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
@@ -679,6 +701,12 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+    finally:
+        # Log whatever was actually spoken, complete or interrupted —
+        # a partial reply is still a real reply Sir heard.
+        if log_channel and spoken:
+            cross_channel_log.append_turn(log_channel, "assistant",
+                                           " ".join(spoken))
 
 
 async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
@@ -1155,8 +1183,33 @@ async def amain():
             # wait on a ResultMessage the CLI is withholding for an answer.
             _deny_pending()
             await brain.reset_turn()
+            # Cross-channel catch-up (local/house voice only — see
+            # backtalk/docs/superpowers/specs/
+            # 2026-09-08-cross-channel-memory-design.md): fold in
+            # anything new from Telegram since this process last saw it,
+            # WITHOUT touching `text` itself — `text` is the pristine
+            # utterance already used above for quit/console/gate
+            # matching and is what gets logged as this turn's "user"
+            # side below.
+            brain_text = text
+            if source == "local":
+                global _LAST_SEEN_TELEGRAM_TS
+                new_from_telegram = cross_channel_log.recent_entries(
+                    hours=48, channel="telegram",
+                    since_ts=_LAST_SEEN_TELEGRAM_TS)
+                if new_from_telegram:
+                    _LAST_SEEN_TELEGRAM_TS = new_from_telegram[-1]["ts"]
+                    catch_up = "\n".join(
+                        f"[{e['ts'][11:16]} telegram] "
+                        f"{'Sir' if e['role'] == 'user' else 'Jarvis'}: "
+                        f"{e['text']}" for e in new_from_telegram)
+                    brain_text = (
+                        "[Since we last spoke, this happened on "
+                        f"Telegram:\n{catch_up}\n---]\n{text}")
+                cross_channel_log.append_turn("voice", "user", text)
             speak_task = asyncio.create_task(
-                speak_reply(brain, mouth, text, source=source, epoch=epoch))
+                speak_reply(brain, mouth, brain_text, source=source,
+                            epoch=epoch, log_channel="voice" if source == "local" else None))
             started_speak = True
             return True
         finally:

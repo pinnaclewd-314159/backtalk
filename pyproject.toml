@@ -25,6 +25,33 @@ dependencies = [
     # same code with binary wheels, importing as the identical module.
     "webrtcvad>=2.0.10 ; sys_platform != 'win32'",
     "webrtcvad-wheels>=2.0.10 ; sys_platform == 'win32'",
+    # Windows GPU box (RTX 2080 Ti): kokoro pulls in a generic torch,
+    # which resolves to the CPU-only wheel with no source override --
+    # Kokoro TTS would silently run on CPU forever. Pin the CUDA build
+    # explicitly (matches torchaudio below; mismatched versions between
+    # the two fail to import at all -- torchaudio's compiled extension
+    # refuses to load against a torch build it wasn't compiled for).
+    # KPipeline auto-detects torch.cuda.is_available(), no code change
+    # needed once this resolves to a CUDA wheel.
+    "torch==2.9.1+cu130 ; sys_platform == 'win32'",
+    # Only pulled in (by transformers, via kokoro/misaki) to satisfy an
+    # import-time dependency, never used for actual audio here -- but it
+    # must match torch's version+variant exactly or the import itself
+    # throws (see torch note above).
+    "torchaudio==2.9.1+cu130 ; sys_platform == 'win32'",
+    # faster-whisper's ctranslate2 backend is hard-pinned to CUDA 12's
+    # cuBLAS/cuDNN DLL naming (cublas64_12.dll etc.) regardless of which
+    # CUDA Toolkit is actually installed on the machine (this box runs
+    # CUDA 13.3, which only ships cublas64_13.dll) -- see
+    # github.com/OpenNMT/CTranslate2/issues/1630. These pip wheels
+    # bundle the actual CUDA 12 runtime DLLs so ctranslate2 has
+    # something to find; ears.py puts their bin/ folders on PATH before
+    # importing faster_whisper (CTranslate2's own loader reads PATH
+    # directly -- os.add_dll_directory alone does not work, verified).
+    "nvidia-cublas-cu12 ; sys_platform == 'win32'",
+    "nvidia-cudnn-cu12==9.* ; sys_platform == 'win32'",
+    "nvidia-cuda-runtime-cu12 ; sys_platform == 'win32'",
+    "nvidia-cuda-nvrtc-cu12 ; sys_platform == 'win32'",
 ]
 
 [tool.setuptools]
@@ -32,3 +59,16 @@ packages = ["backtalk"]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

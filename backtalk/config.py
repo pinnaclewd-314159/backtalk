@@ -188,6 +188,33 @@ DEFAULTS = {
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
                    "release=120:makeup=4dB,alimiter=limit=0.95"),
     },
+    # Optional premium voice #2: Voicebox, a local TTS server (see
+    # https://github.com/jamiepine/voicebox) running on this machine —
+    # no API key, no cloud call, but a real clone/model of your choice
+    # instead of Kokoro's stock voice. Checked BEFORE elevenlabs in
+    # mouth.synth_stream, with Kokoro as the final fallback either way,
+    # so the voice degrades instead of going mute if the server is down.
+    #
+    # `engine` is sent explicitly on every request rather than left to
+    # the server's own default — found the hard way that Voicebox's
+    # /generate endpoint bakes "qwen" in as the request model's own
+    # default, so an omitted engine field never actually reaches the
+    # profile's default_engine setting; only an explicit null would.
+    # Hardcoding it here sidesteps that footgun entirely.
+    "voicebox": {
+        "enabled": False,
+        "base_url": "http://127.0.0.1:17493",
+        # The voice profile's ID (Voicebox's own UI has no visible field
+        # for this — pull it from GET {base_url}/profiles instead).
+        "profile_id": "",
+        "engine": "chatterbox_turbo",
+        # Voicebox's own punctuation-aware chunking + crossfade, reused
+        # instead of reimplementing the manual pacing/volume hacks the
+        # LuxTTS-era testing needed. 100 is the server's own floor.
+        "max_chunk_chars": 150,
+        "crossfade_ms": 50,
+        "normalize": True,
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.

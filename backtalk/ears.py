@@ -25,6 +25,8 @@ an utterance opens after ~120ms of sustained speech, closes after
 `silence_ms` of trailing quiet. A `gate` callable can suppress
 listening (so the open mic ignores the speakers unless barge-in is on).
 """
+import importlib.util
+import os
 import platform
 import re
 import sys
@@ -280,6 +282,33 @@ def _probe(model):
     list(segments)
 
 
+def _add_cuda_dll_dirs():
+    """Windows only: put the pip-installed CUDA 12 runtime DLLs on PATH.
+
+    ctranslate2 (faster-whisper's backend) is hard-pinned to CUDA 12's
+    cuBLAS/cuDNN naming regardless of which CUDA Toolkit is actually
+    installed (github.com/OpenNMT/CTranslate2/issues/1630) -- this box
+    runs CUDA 13.3, which only ships cublas64_13.dll. The nvidia-*-cu12
+    pip wheels (declared in pyproject.toml) bundle the real CUDA 12
+    DLLs, but ctranslate2's own loader reads them off PATH directly --
+    verified `os.add_dll_directory` alone does NOT work here, despite
+    being the normally-correct Windows mechanism for this. Idempotent
+    and cheap; safe to call every warm().
+    """
+    if sys.platform != "win32":
+        return
+    dirs = []
+    for pkg in ("nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_runtime",
+                "nvidia.cuda_nvrtc"):
+        spec = importlib.util.find_spec(pkg)
+        if spec and spec.submodule_search_locations:
+            d = os.path.join(list(spec.submodule_search_locations)[0], "bin")
+            if os.path.isdir(d):
+                dirs.append(d)
+    if dirs:
+        os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ.get("PATH", "")
+
+
 def warm():
     """Load the STT model (first call downloads it to the HF cache).
     Called at startup while the greeting plays, so the first real
@@ -300,6 +329,7 @@ def warm():
                                        verbose=None)
                 _model, _backend = repo, "mlx"
             else:
+                _add_cuda_dll_dirs()
                 from faster_whisper import WhisperModel
                 want = CFG["stt_device"]
                 log(f"[ears] loading {CFG['stt_model']} "
@@ -326,8 +356,13 @@ def warm():
                     log("[ears] falling back to the CPU. Set "
                         "\"stt_device\": \"cpu\" in backtalk.json to skip "
                         "this check in future.")
+                    # NOT CFG["stt_compute"] -- that's tuned for the GPU
+                    # path (float16), and CTranslate2 refuses float16 on
+                    # CPU outright. int8 is CPU's own efficient default
+                    # (see config.py), so the fallback actually degrades
+                    # instead of crashing on top of the GPU failure.
                     _model = WhisperModel(CFG["stt_model"], device="cpu",
-                                          compute_type=CFG["stt_compute"])
+                                          compute_type="int8")
                     _probe(_model)
                 _backend = "faster-whisper"
             log(f"[ears] model ready ({_backend})")
