@@ -1,0 +1,140 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Jarvis</title>
+<style>
+  html, body { margin: 0; height: 100dvh; background: #050509; color: #fff;
+               font-family: system-ui, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100dvh; }
+  #face { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; }
+  #talk {
+    flex: 0 0 auto;
+    margin: 16px;
+    margin-bottom: calc(16px + env(safe-area-inset-bottom));
+    padding: 24px;
+    font-size: 1.4rem;
+    border-radius: 16px;
+    border: none;
+    background: #2b6cff;
+    color: #fff;
+    touch-action: none;
+    -webkit-touch-callout: none;
+    user-select: none;
+  }
+  #talk[data-state="listening"] { background: #ff3b30; }
+  #talk[data-state="busy"] { background: #555; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="face"><div id="status">Hold to talk</div></div>
+  <button id="talk" data-state="idle">Hold to talk</button>
+</div>
+<script>
+"use strict";
+const talkBtn = document.getElementById("talk");
+const statusEl = document.getElementById("status");
+const WIRE_RATE = 16000;
+
+let ws = null;
+let audioCtx = null;
+let workletNode = null;
+let micStream = null;
+let capturing = false;
+let capturedChunks = [];
+let playCtx = null;
+let pendingRate = WIRE_RATE;
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = onWsMessage;
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+
+async function onWsMessage(ev) {
+  if (typeof ev.data === "string") {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "state") {
+      talkBtn.dataset.state = msg.state;
+      statusEl.textContent = msg.state === "busy" ? "Jarvis is busy"
+        : msg.state[0].toUpperCase() + msg.state.slice(1) + "...";
+    } else if (msg.type === "audio-chunk") {
+      pendingRate = msg.rate;
+    } else if (msg.type === "audio-stop") {
+      talkBtn.dataset.state = "idle";
+      statusEl.textContent = "Hold to talk";
+    }
+  } else {
+    await playChunk(ev.data, pendingRate);
+  }
+}
+
+async function playChunk(arrayBuffer, rate) {
+  if (!playCtx) playCtx = new AudioContext();
+  const int16 = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+  const buf = playCtx.createBuffer(1, float32.length, rate);
+  buf.copyToChannel(float32, 0);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playCtx.destination);
+  src.start();
+}
+
+async function startCapture() {
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    await audioCtx.audioWorklet.addModule("pcm-processor.js");
+  }
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const source = audioCtx.createMediaStreamSource(micStream);
+  workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+  capturedChunks = [];
+  workletNode.port.onmessage = (e) => { if (capturing) capturedChunks.push(e.data); };
+  source.connect(workletNode);
+  capturing = true;
+  ws.send(JSON.stringify({ type: "utterance_start", rate: audioCtx.sampleRate }));
+  talkBtn.dataset.state = "listening";
+  statusEl.textContent = "Listening...";
+}
+
+function stopCapture() {
+  if (!capturing) return;
+  capturing = false;
+  micStream.getTracks().forEach((t) => t.stop());
+  workletNode.disconnect();
+
+  let total = 0;
+  for (const c of capturedChunks) total += c.length;
+  const int16 = new Int16Array(total);
+  let offset = 0;
+  for (const c of capturedChunks) {
+    for (let i = 0; i < c.length; i++) {
+      const s = Math.max(-1, Math.min(1, c[i]));
+      int16[offset++] = s < 0 ? s * 32768 : s * 32767;
+    }
+  }
+  ws.send(int16.buffer);
+  ws.send(JSON.stringify({ type: "utterance_end" }));
+  statusEl.textContent = "Sending...";
+}
+
+talkBtn.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  if (talkBtn.dataset.state === "busy") return;
+  startCapture();
+});
+talkBtn.addEventListener("pointerup", (e) => { e.preventDefault(); stopCapture(); });
+talkBtn.addEventListener("pointercancel", (e) => { e.preventDefault(); stopCapture(); });
+talkBtn.addEventListener("pointerleave", (e) => { if (capturing) stopCapture(); });
+talkBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+
+connect();
+</script>
+</body>
+</html>
