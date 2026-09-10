@@ -251,6 +251,11 @@ DEFAULTS = {
     # hardcodes this exact port on the firmware side -- changing it here
     # without a matching firmware change breaks every satellite.
     "wyoming_port": 10700,
+    # TCP port for the browser push-to-talk client (web_client.py) —
+    # serves both the static face/button page and the WebSocket PTT
+    # protocol on one port via websockets' process_request hook. See
+    # docs/superpowers/specs/2026-09-10-web-ptt-client-design.md.
+    "web_ptt_port": 8795,
     # THE BAREHANDS SEAM: point this at a barehands checkout's state/
     # folder and its on-screen ring becomes your agent's face — it
     # breathes while idle, spins while thinking, pulses with the voice.
