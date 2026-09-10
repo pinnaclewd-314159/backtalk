@@ -105,7 +105,7 @@ async def push_state(conn: WebConnection, state: str) -> None:
 # path reaches the filesystem, so the containment check is not optional
 # even under the LAN-only trust model.
 def _static_response(static_dir: Path, path: str) -> Response:
-    rel = "index.html" if path in ("/", "") else path.lstrip("/")
+    rel = "ptt.html" if path in ("/", "") else path.lstrip("/")
     target = (static_dir / rel).resolve()
     try:
         target.relative_to(static_dir.resolve())
