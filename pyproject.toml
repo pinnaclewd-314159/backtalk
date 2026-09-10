@@ -15,6 +15,10 @@ dependencies = [
     # platform keeps faster-whisper, which already uses CUDA.
     "mlx-whisper>=0.4.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
+    # Wake-word gating for local hands-free mode: pretrained "hey_jarvis"
+    # model, CPU-only onnxruntime backend, no GPU/tflite dependency.
+    # See docs/superpowers/specs/2026-09-10-wake-word-gating-design.md.
+    "openwakeword>=0.6.0",
     "pynput>=1.8.0",
     "setuptools<81",
     "sounddevice>=0.5.0",
@@ -39,6 +43,12 @@ dependencies = [
     # must match torch's version+variant exactly or the import itself
     # throws (see torch note above).
     "torchaudio==2.9.1+cu130 ; sys_platform == 'win32'",
+    # Used by tools/homeassistant.py's `registry`/`rename` commands
+    # (HA's entity-registry API is WebSocket-only, no REST equivalent)
+    # via this same venv. Was installed ad hoc and missing from this
+    # file entirely -- `uv sync` silently strips anything not declared
+    # here, which is what surfaced the gap. Declaring it properly now.
+    "websockets>=13.0",
     # faster-whisper's ctranslate2 backend is hard-pinned to CUDA 12's
     # cuBLAS/cuDNN DLL naming (cublas64_12.dll etc.) regardless of which
     # CUDA Toolkit is actually installed on the machine (this box runs

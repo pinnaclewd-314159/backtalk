@@ -106,6 +106,21 @@ DEFAULTS = {
     # snappy default; raise it if you get cut off mid-thought on
     # pauses, lower it for faster turnaround on a quiet mic.
     "silence_ms": 480,
+    # Wake-word gating for hands-free listening: require "Hey Jarvis"
+    # before a turn starts, same trigger the satellites already use.
+    # OFF by default until confirmed working live — with this false,
+    # hands-free mode behaves exactly as it does today (plain VAD,
+    # no wake word). See docs/superpowers/specs/
+    # 2026-09-10-wake-word-gating-design.md.
+    "wake_word": {
+        "enabled": False,
+        # openWakeWord's own recommended default for "hey_jarvis".
+        "threshold": 0.5,
+        # After a reply, how long (seconds) to keep listening for a
+        # follow-up before requiring the wake word again.
+        "grace_window_s": 9,
+        "chime": True,
+    },
     # Playback speed for the built-in voice: 1.0 is Kokoro's native
     # pace, 1.15 is noticeably brisker, 0.9 is slower. Kokoro's own
     # pipeline implements it, so quality holds across sane values
