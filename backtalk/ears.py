@@ -137,8 +137,10 @@ def _mic_index():
     return None
 
 
-def _open_mic():
-    """Open the capture stream on the configured mic.
+def _open_mic(blocksize: int = FRAME_LEN):
+    """Open the capture stream on the configured mic, at `blocksize`
+    samples per read (default FRAME_LEN, the 30ms VAD frame size;
+    wait_for_wake() below passes wakeword.FRAME_LEN instead).
 
     Degrades to the system default if that device will not open --
     unplugged between the lookup and the open, busy, or refusing the
@@ -146,7 +148,7 @@ def _open_mic():
     """
     dev = _mic_index()
     opts = dict(samplerate=RATE, channels=1, dtype="int16",
-                blocksize=FRAME_LEN)
+                blocksize=blocksize)
     try:
         return sd.InputStream(device=dev, **opts)
     except Exception as e:
@@ -455,6 +457,33 @@ class Ears:
                             speech_run = speech_total = 0
                             continue
                         return transcribe(np.concatenate(frames))
+
+
+def wait_for_wake(gate=None, abort=None, detector=None) -> bool:
+    """Block until the wake word fires. Returns True on detection,
+    False if `abort()` returns True first (a mode switch, matching
+    listen_once()'s own abort contract).
+
+    Opens its OWN stream at openWakeWord's native 80ms chunk size --
+    a separate phase from listen_once()'s 30ms VAD frames, opened and
+    closed independently, so the two frame sizes are never reconciled
+    (see the design spec's rejected two-stream and buffering
+    alternatives)."""
+    from backtalk import wakeword
+    from backtalk.config import CFG
+    if detector is None:
+        detector = wakeword.get_detector()
+    threshold = float(CFG.get("wake_word", {}).get("threshold", 0.5))
+    with _open_mic(blocksize=wakeword.FRAME_LEN) as stream:
+        while True:
+            if abort and abort():
+                return False
+            block, _ = stream.read(wakeword.FRAME_LEN)
+            if gate and gate():
+                continue
+            mono = block[:, 0].copy()
+            if detector.score(mono) >= threshold:
+                return True
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
