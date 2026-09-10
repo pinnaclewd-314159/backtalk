@@ -430,6 +430,27 @@ _PASTE_OFF = "\x1b[201~"
 # swallow a paragraph into one "tag".
 _DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
 
+# Backstop for a cloud turn that goes silent instead of erroring (the
+# 2026-09-09 outage: a hung WarmBrain call never raised, so force_offline()
+# never fired and the turn just sat there until the network came back by
+# hand). This is deliberately generous — real high-effort turns have been
+# observed taking up to ~240s to first token — so it only trips on a truly
+# dead connection, never a legitimately slow-but-alive one.
+_CLOUD_TURN_TIMEOUT_S = 300.0
+
+
+async def _with_timeout(aiter, timeout: float):
+    """Wrap an async iterator so a stalled upstream that never raises (just
+    goes silent) surfaces as a real TimeoutError instead of hanging forever
+    — the only way force_offline() gets a chance to fire in that case."""
+    it = aiter.__aiter__()
+    while True:
+        try:
+            item = await asyncio.wait_for(it.__anext__(), timeout)
+        except StopAsyncIteration:
+            return
+        yield item
+
 # Shared satellite state, module-level singletons -- the same pattern this
 # file already uses for _AUTOAPPROVE/_MIC. speak_reply() is a top-level
 # function (not nested inside amain()), so it cannot see amain()'s locals;
@@ -695,9 +716,12 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
                 batch = []
 
     is_cloud = isinstance(brain, WarmBrain)
+    stream = brain.ask_stream(text)
+    if is_cloud:
+        stream = _with_timeout(stream, _CLOUD_TURN_TIMEOUT_S)
     try:
         try:
-            async for sentence in brain.ask_stream(text):
+            async for sentence in stream:
                 emit(sentence)
         except asyncio.CancelledError:
             raise
@@ -763,8 +787,11 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
 
     async def _rated_chunks():
         """(rate, pcm) for the WHOLE reply, in order, as it renders."""
+        stream = brain.ask_stream(text)
+        if isinstance(brain, WarmBrain):
+            stream = _with_timeout(stream, _CLOUD_TURN_TIMEOUT_S)
         try:
-            async for sentence in brain.ask_stream(text):
+            async for sentence in stream:
                 # Directions are stripped, never spoken. There is no local
                 # signal-bus listener relevant to a satellite's room, so
                 # they are dropped rather than published against audio
@@ -860,7 +887,8 @@ async def amain():
     lf_cfg = CFG.get("local_fallback", {})
     local_brain = LocalBrain(can_use_tool=perm_gate,
                               base_url=lf_cfg.get("base_url",
-                                                  "http://127.0.0.1:8712"))
+                                                  "http://127.0.0.1:8712"),
+                              speak_fn=mouth.say)
 
     async def _on_connectivity_change(online: bool):
         if online:
@@ -933,7 +961,8 @@ async def amain():
             interval_s=lf_cfg.get("poll_interval_s", 20.0),
             timeout_s=lf_cfg.get("poll_timeout_s", 4.0),
             threshold=lf_cfg.get("poll_threshold", 2),
-            initial_online=not booted_offline)
+            initial_online=not booted_offline,
+            loop=loop)
     if not booted_offline:
         log("[backtalk] brain warm")
         brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)

@@ -31,7 +31,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Optional
 
 import httpx
 
@@ -50,6 +50,38 @@ _MATH_RE = re.compile(
     r"(-?\d+(?:\.\d+)?)\s*\??\s*$", re.I)
 _MATH_OPS = {"plus": "+", "minus": "-", "times": "*", "x": "*",
              "divided by": "/", "+": "+", "-": "-", "*": "*", "/": "/"}
+_TIMER_TRIGGER_RE = re.compile(r"\b(?:set|start)\b.*\btimer\b|\btimer\b", re.I)
+
+# Whisper transcribes small spoken numbers as words ("two minutes"), not
+# digits ("2 minutes") - so the duration parser has to understand both.
+_ONES_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven",
+               "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+               "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+               "nineteen"]
+_TENS_WORDS = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+               "eighty", "ninety"]
+_ONES_MAP = {w: i for i, w in enumerate(_ONES_WORDS)}
+_TENS_MAP = {w: (i + 2) * 10 for i, w in enumerate(_TENS_WORDS)}
+_NUMBER_WORD_ALT = "|".join(["a", "an"] + _TENS_WORDS + _ONES_WORDS)
+_DURATION_PART_RE = re.compile(
+    r"(\d+(?:\.\d+)?|(?:" + _NUMBER_WORD_ALT + r")(?:[\s-]+(?:" +
+    "|".join(_ONES_WORDS) + r"))?)\s*"
+    r"(hours?|hrs?|minutes?|mins?|seconds?|secs?)\b", re.I)
+_UNIT_SECONDS = {
+    "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+    "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+    "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+}
+
+
+def _word_to_number(phrase: str) -> float:
+    """Turns a spelled-out number like "twenty five" into 25.0. Assumes
+    every token is already a known number word (only ever called on text
+    that matched _NUMBER_WORD_ALT)."""
+    total = 0
+    for word in re.split(r"[\s-]+", phrase.strip()):
+        total += _TENS_MAP.get(word, _ONES_MAP.get(word, 0))
+    return float(total)
 
 FALLBACK_LINE = ("I'm offline right now. I can only handle device "
                   "control and a few basics until the connection's back.")
@@ -107,6 +139,37 @@ TOOLS = [
 ]
 
 
+def _parse_duration_seconds(text: str) -> float:
+    """Sums every "<number> <unit>" span found, so "5 minutes 30 seconds"
+    and "1 hour and 15 minutes" both work - as do spelled-out equivalents
+    like "two minutes" or "a minute". Returns 0 if none found."""
+    total = 0.0
+    for amount, unit in _DURATION_PART_RE.findall(text):
+        amount = amount.strip().lower()
+        if amount in ("a", "an"):
+            value = 1.0
+        elif amount[0].isdigit():
+            value = float(amount)
+        else:
+            value = _word_to_number(amount)
+        total += value * _UNIT_SECONDS[unit.lower()]
+    return total
+
+
+def _humanize_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if secs:
+        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+    return " ".join(parts) if parts else "0 seconds"
+
+
 def _canned_reply(utterance: str) -> str | None:
     """A short, deliberately non-growing list — see the module docstring.
     Returns None (fall through to the model) for anything not on it."""
@@ -129,15 +192,68 @@ def _canned_reply(utterance: str) -> str | None:
 
 class LocalBrain:
     def __init__(self, can_use_tool, base_url: str = "http://127.0.0.1:8712",
-                 timeout_s: float = 60.0):
+                 timeout_s: float = 60.0,
+                 speak_fn: Optional[Callable[[str], None]] = None):
         self._can_use_tool = can_use_tool
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
+        # Lets a timer announce itself once it fires, unprompted, the
+        # same way main.py's connectivity-change handler calls
+        # mouth.say() directly outside of any turn. None in tests/CLI
+        # use (see __main__ below) - a fired timer just logs instead.
+        self._speak_fn = speak_fn
+        self._timers: set[asyncio.Task] = set()
+        # True right after we ask "how long should the timer be?" so the
+        # very next utterance is read as the answer even without the
+        # word "timer" in it — LocalBrain has no other turn memory.
+        self._awaiting_timer_duration = False
+
+    def _start_timer(self, seconds: float, label: str) -> None:
+        task = asyncio.create_task(self._run_timer(seconds, label))
+        self._timers.add(task)
+        task.add_done_callback(self._timers.discard)
+
+    async def _run_timer(self, seconds: float, label: str) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        log(f"[local_brain] timer done: {label}")
+        if self._speak_fn is None:
+            log("[local_brain] timer fired but no speak_fn wired - "
+                "can't announce it")
+            return
+        try:
+            self._speak_fn(f"Sir, your {label} timer is up.")
+        except Exception as e:
+            log(f"[local_brain] timer announce failed: {e!r}")
 
     async def ask_stream(self, utterance: str) -> AsyncIterator[str]:
+        if self._awaiting_timer_duration:
+            self._awaiting_timer_duration = False
+            seconds = _parse_duration_seconds(utterance)
+            if seconds > 0:
+                label = _humanize_duration(seconds)
+                self._start_timer(seconds, label)
+                yield f"Timer set for {label}."
+                return
+            # Not a duration answer - treat this utterance normally
+            # instead of swallowing it as a failed duration parse.
+
         canned = _canned_reply(utterance)
         if canned is not None:
             yield canned
+            return
+
+        if _TIMER_TRIGGER_RE.search(utterance):
+            seconds = _parse_duration_seconds(utterance)
+            if seconds <= 0:
+                self._awaiting_timer_duration = True
+                yield "How long should the timer be?"
+                return
+            label = _humanize_duration(seconds)
+            self._start_timer(seconds, label)
+            yield f"Timer set for {label}."
             return
 
         try:
@@ -226,6 +342,58 @@ if __name__ == "__main__":
         assert out.strip() == "Done.", f"expected Done., got {out!r}"
         out = await collect("what's the weather like today")
         assert out.strip() == FALLBACK_LINE.strip(), f"expected fallback line, got {out!r}"
+
+        announced = []
+        timer_brain = LocalBrain(can_use_tool=_allow_all,
+                                  speak_fn=announced.append)
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("set a timer for 2 seconds")])
+        assert "2 seconds" in out, f"expected '2 seconds' in {out!r}"
+        assert not announced, "timer fired before its duration elapsed"
+        await asyncio.sleep(2.3)
+        assert len(announced) == 1, f"expected one announcement, got {announced!r}"
+        assert "2 seconds" in announced[0], f"expected duration in {announced[0]!r}"
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("set a timer")])
+        assert out.strip() == "How long should the timer be?", f"got {out!r}"
+
+        # Follow-up answer to "how long" shouldn't need the word "timer".
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("set a timer")])
+        assert out.strip() == "How long should the timer be?", f"got {out!r}"
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("5 seconds")])
+        assert "5 seconds" in out, f"expected '5 seconds' in {out!r}"
+
+        # A non-duration reply after the question should fall through
+        # normally instead of being swallowed as a failed duration parse.
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("set a timer")])
+        assert out.strip() == "How long should the timer be?", f"got {out!r}"
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("what time is it")])
+        assert ":" in out, f"expected a time in {out!r}"
+
+        # Spelled-out numbers, straight from tonight's live failure:
+        # Whisper transcribes "two minutes" as words, not digits, and
+        # the parser used to only understand digits.
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("start a timer for two minutes")])
+        assert "2 minutes" in out, f"expected '2 minutes' in {out!r}"
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("set a timer for twenty five seconds")])
+        assert "25 seconds" in out, f"expected '25 seconds' in {out!r}"
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("set a timer for a minute")])
+        assert "1 minute" in out, f"expected '1 minute' in {out!r}"
+
+        # Same spelled-out numbers on the two-step follow-up path.
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("start a timer")])
+        assert out.strip() == "How long should the timer be?", f"got {out!r}"
+        out = " ".join([s async for s in
+                         timer_brain.ask_stream("two minutes")])
+        assert "2 minutes" in out, f"expected '2 minutes' in {out!r}"
         print("local_brain self-test: OK")
 
     asyncio.run(_run())
