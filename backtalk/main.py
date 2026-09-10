@@ -75,8 +75,9 @@ from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.local_brain import LocalBrain
+from backtalk import wakeword
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
-                           warm as warm_ears)
+                           wait_for_wake, warm as warm_ears)
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -119,6 +120,21 @@ _AUTOAPPROVE = {"on": False}
 # open-mic capture from before the switch gets discarded, never
 # processed.
 _MIC = {"mode": "ptt", "gen": 0, "btn": False}
+# Set False if the wake-word model fails to load at startup -- the
+# hands-free loop then runs with plain VAD for this session instead
+# of crashing or silently hanging on every wait_for_wake() call. See
+# the "model load failure" case in the design spec's Error Handling.
+_WAKE = {"ready": True}
+
+
+def _load_wake_detector():
+    try:
+        wakeword.get_detector()
+    except Exception as e:
+        log(f"[wakeword] hey_jarvis model failed to load ({e!r}) -- "
+            f"hands-free mode will use plain VAD this session, "
+            f"same as wake_word.enabled being false.")
+        _WAKE["ready"] = False
 
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
@@ -917,6 +933,8 @@ async def amain():
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
     loop.run_in_executor(None, warm_ears)
+    if CFG.get("wake_word", {}).get("enabled"):
+        loop.run_in_executor(None, _load_wake_detector)
     # THE BRAIN CONNECT, guarded. This is the one startup step that
     # needs a signed-in Claude Code, internet, and available usage.
     # When it fails or hangs, the mouth still works, so SAY SO instead
@@ -1308,6 +1326,16 @@ async def amain():
             if not started_speak:
                 turn_lock.release(source, epoch)
 
+    # _WAKE["ready"] starts True and only ever flips False from
+    # _load_wake_detector() above -- by the time this loop starts
+    # (well after the brain-connect + warmup-ping awaits), the
+    # detector's own small CPU model load has had ample time to
+    # finish or fail, so this reads the real outcome, not a race.
+    WAKE_ENABLED = (bool(CFG.get("wake_word", {}).get("enabled", False))
+                     and _WAKE["ready"])
+    GRACE_S = float(CFG.get("wake_word", {}).get("grace_window_s", 9))
+    CHIME_ON = bool(CFG.get("wake_word", {}).get("chime", True))
+
     try:
         # ONE loop, two mic modes, switchable live (_MIC). The talk key
         # is constructed and honored in BOTH modes: in hands-free
@@ -1316,6 +1344,15 @@ async def amain():
         # in "open" mode; a mode switch bumps _MIC["gen"], the abort
         # callable closes the in-flight open mic promptly, and any
         # capture born under an old gen is discarded unprocessed.
+        #
+        # When WAKE_ENABLED, "open" mode cycles three states:
+        # "wake" (must hear "Hey Jarvis" next) -> "capture" (wake just
+        # fired, capturing that command, no timeout) -> "grace"
+        # (a reply just finished; listening for an optional follow-up
+        # for GRACE_S before re-arming "wake"). WAKE_ENABLED false
+        # reproduces today's behavior exactly -- mic_state never
+        # leaves "wake" and every call behaves like the old bare
+        # listen_once(gate=mic_gate, abort=...).
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
@@ -1326,9 +1363,11 @@ async def amain():
         mic_gate = (lambda: _MIC["btn"]
                     or (not barge_in and mouth.speaking))
         mic_fails = 0
+        mic_state = "wake"
         while True:
             if _MIC["gen"] != mic_gen_seen:
                 mic_gen_seen = _MIC["gen"]
+                mic_state = "wake"     # a fresh mode entry always re-arms
                 # consume futures that completed under the old mode so
                 # a stale press or capture can't fire after a switch
                 if press_fut is not None and press_fut.done():
@@ -1343,10 +1382,19 @@ async def amain():
             if _MIC["mode"] == "open":
                 if mic_fut is None:
                     g = _MIC["gen"]
-                    mic_fut = loop.run_in_executor(
-                        None, lambda g=g: (g, ears.listen_once(
-                            gate=mic_gate,
-                            abort=lambda: _MIC["gen"] != g)))
+                    if WAKE_ENABLED and mic_state == "wake":
+                        mic_fut = loop.run_in_executor(
+                            None, lambda g=g: (g, "wake", wait_for_wake(
+                                gate=mic_gate,
+                                abort=lambda: _MIC["gen"] != g)))
+                    else:
+                        t = GRACE_S if (WAKE_ENABLED and
+                                        mic_state == "grace") else None
+                        mic_fut = loop.run_in_executor(
+                            None, lambda g=g, t=t: (g, "listen",
+                                ears.listen_once(
+                                    gate=mic_gate, timeout_s=t,
+                                    abort=lambda: _MIC["gen"] != g)))
                 waiters.add(mic_fut)
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
@@ -1357,7 +1405,7 @@ async def amain():
                 continue
             if mic_fut is not None and mic_fut in done:
                 try:
-                    g, text = mic_fut.result()
+                    g, phase, result = mic_fut.result()
                 except Exception as e:
                     mic_fut = None
                     mic_fails += 1
@@ -1375,8 +1423,22 @@ async def amain():
                 mic_fut = None
                 if g != _MIC["gen"]:
                     continue             # captured before a switch
-                if text and not await handle(text):
-                    return
+                if phase == "wake":
+                    if result:           # wake word fired
+                        if CHIME_ON:
+                            await loop.run_in_executor(None, wakeword.chime)
+                        mic_state = "capture"
+                    continue             # either way, re-schedule next loop
+                # phase == "listen"
+                text = result
+                if text:
+                    if WAKE_ENABLED:
+                        mic_state = "grace"   # a reply is about to play;
+                                               # listen for a follow-up after
+                    if not await handle(text):
+                        return
+                elif WAKE_ENABLED and mic_state == "grace":
+                    mic_state = "wake"        # grace window timed out: re-arm
                 continue
             if press_fut in done:
                 press_fut.result(); press_fut = None
