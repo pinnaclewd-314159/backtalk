@@ -72,6 +72,7 @@ import cross_channel_log  # noqa: E402
 from backtalk import connectivity
 from backtalk import satellites
 from backtalk import signals
+from backtalk import web_client
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.local_brain import LocalBrain
@@ -476,6 +477,20 @@ async def _with_timeout(aiter, timeout: float):
 # `global` declaration is needed anywhere.
 turn_lock = satellites.TurnLock()
 sat_registry = satellites.SatelliteRegistry()
+web_registry = satellites.SatelliteRegistry()   # generic, reused as-is
+
+
+async def _send_reply(conn, gen):
+    if isinstance(conn, web_client.WebConnection):
+        return await web_client.send_reply(conn, gen)
+    return await satellites.send_reply(conn, gen)
+
+
+async def _send_stop(conn):
+    if isinstance(conn, web_client.WebConnection):
+        await web_client.send_stop(conn)
+    else:
+        await satellites.send_stop(conn)
 
 
 def _clean_typed(line: str) -> str:
@@ -790,6 +805,8 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
     # this file (e.g. inside make_permission_gate).
     t0 = time.time()
     speaking = False
+    if isinstance(source, web_client.WebConnection):
+        asyncio.create_task(web_client.push_state(source, "thinking"))
 
     def _mark_speaking():
         # The first byte of real audio is where a satellite turn stops
@@ -800,6 +817,8 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
             speaking = True
             signals.static_stop()
             signals.set_state("speaking")
+            if isinstance(source, web_client.WebConnection):
+                asyncio.create_task(web_client.push_state(source, "speaking"))
 
     async def _rated_chunks():
         """(rate, pcm) for the WHOLE reply, in order, as it renders."""
@@ -843,13 +862,14 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
 
     gen = _rated_chunks()
     try:
-        ok = await satellites.send_reply(conn, gen)
+        ok = await _send_reply(conn, gen)
         if not ok:
             # The socket died mid-reply. send_reply already abandoned the
             # generator (so nothing further is synthesized), and there is
             # nothing left to say to a connection that is gone — no
             # apology, no audio-stop.
-            sat_registry.remove(conn)
+            (web_registry if isinstance(conn, web_client.WebConnection)
+             else sat_registry).remove(conn)
     except asyncio.CancelledError:
         try:
             await brain.interrupt()
@@ -857,7 +877,7 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
             pass
         # The envelope is open and no audio-stop was written: tell the
         # firmware the audio it is waiting for isn't coming.
-        await satellites.send_stop(conn)
+        await _send_stop(conn)
         raise
     finally:
         try:
@@ -1038,6 +1058,11 @@ async def amain():
         "0.0.0.0", CFG["wyoming_port"], _on_satellite_utterance, sat_registry,
         on_disconnect=_on_satellite_disconnect)
     log(f"[backtalk] satellite listener on port {CFG['wyoming_port']}")
+    await web_client.start_server(
+        "0.0.0.0", CFG["web_ptt_port"], _on_satellite_utterance, web_registry,
+        static_dir=Path(__file__).resolve().parent.parent / "web",
+        on_disconnect=_on_satellite_disconnect)
+    log(f"[backtalk] PTT web server on port {CFG['web_ptt_port']}")
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -1194,6 +1219,8 @@ async def amain():
             # otherwise be free to carry its raw mic PCM into the log file.
             log(f"[satellites] dropped utterance from {source.name} "
                f"(turn owned by {getattr(owner, 'name', owner)})")
+            if isinstance(source, web_client.WebConnection):
+                await web_client.push_state(source, "busy")
             return True
         if source == "local":
             # always succeeds; may steal from a satellite
@@ -1265,7 +1292,7 @@ async def amain():
                 speak_task.cancel()
                 mouth.shut_up()
                 if prev_owner not in ("local", None) and prev_owner != source:
-                    await satellites.send_stop(prev_owner)
+                    await _send_stop(prev_owner)
             if speak_task:
                 # Let the cancellation fully land (its brain.interrupt()
                 # included) BEFORE anything else touches the brain —
