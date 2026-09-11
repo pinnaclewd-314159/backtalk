@@ -54,12 +54,31 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
   }
   #talk[data-state="listening"]{background:#ff3b30}
   #talk[data-state="busy"]{background:#555}
+  /* Debug log panel -- no devtools needed, works on any device. Remove
+     once the real device bugs found tonight are actually resolved;
+     this is diagnostic scaffolding, not a permanent feature. */
+  #dlog{
+    flex:0 0 auto;
+    max-height:30vh;
+    overflow-y:auto;
+    background:#000;
+    color:#7fff9f;
+    font:11px/1.4 monospace;
+    padding:8px 10px;
+    padding-bottom:calc(8px + env(safe-area-inset-bottom));
+    white-space:pre-wrap;
+    word-break:break-word;
+    -webkit-user-select:text;
+    user-select:text;
+  }
+  #dlog .err{color:#ff6b6b}
 </style>
 </head>
 <body>
 <div id="app">
   <div id="face"><canvas id="stage"></canvas></div>
   <button id="talk" data-state="idle">Hold to talk</button>
+  <div id="dlog"></div>
 </div>
 <script src="core.js"></script>
 <script>
@@ -659,7 +678,30 @@ if(AV.shot){
 <script>
 "use strict";
 const talkBtn = document.getElementById("talk");
+const dlogEl = document.getElementById("dlog");
 const WIRE_RATE = 16000;
+
+function dlog(msg, isErr) {
+  const line = document.createElement("div");
+  if (isErr) line.className = "err";
+  const t = new Date().toLocaleTimeString();
+  line.textContent = `[${t}] ${msg}`;
+  dlogEl.appendChild(line);
+  dlogEl.scrollTop = dlogEl.scrollHeight;
+  (isErr ? console.error : console.log)(msg);
+}
+
+// Catches everything that would otherwise fail silently -- this is
+// exactly the gap that made tonight's earlier bugs invisible: an
+// unhandled promise rejection (e.g. getUserMedia throwing) produces
+// zero visible feedback on a phone with no devtools attached.
+window.addEventListener("error", (e) => {
+  dlog(`Uncaught error: ${e.message} (${e.filename}:${e.lineno})`, true);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  dlog(`Unhandled rejection: ${e.reason && e.reason.stack ? e.reason.stack : e.reason}`, true);
+});
+dlog(`Page loaded. protocol=${location.protocol} host=${location.host} mediaDevices=${!!navigator.mediaDevices}`);
 
 let ws = null;
 let audioCtx = null;
@@ -672,10 +714,14 @@ let pendingRate = WIRE_RATE;
 
 function connect() {
   const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${wsProto}//${location.host}/`);
+  const url = `${wsProto}//${location.host}/`;
+  dlog(`Connecting WebSocket to ${url}`);
+  ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   ws.onmessage = onWsMessage;
-  ws.onclose = () => setTimeout(connect, 2000);
+  ws.onopen = () => dlog("WebSocket open");
+  ws.onerror = (e) => dlog(`WebSocket error: ${e.message || e.type}`, true);
+  ws.onclose = (e) => { dlog(`WebSocket closed (code ${e.code}), reconnecting in 2s`, true); setTimeout(connect, 2000); };
 }
 
 async function onWsMessage(ev) {
@@ -712,11 +758,18 @@ async function playChunk(arrayBuffer, rate) {
 }
 
 async function startCapture() {
+  dlog("startCapture: pointerdown fired");
   if (!audioCtx) {
+    dlog("Creating AudioContext + loading worklet module");
     audioCtx = new AudioContext();
+    dlog(`AudioContext created, sampleRate=${audioCtx.sampleRate}, state=${audioCtx.state}`);
     await audioCtx.audioWorklet.addModule("pcm-processor.js");
+    dlog("Worklet module loaded");
   }
-  if (audioCtx.state === "suspended") await audioCtx.resume();
+  if (audioCtx.state === "suspended") {
+    dlog("AudioContext suspended, resuming");
+    await audioCtx.resume();
+  }
   if (!micStream) {
     // Requested once and kept alive for the rest of the page's life --
     // documented WebKit/W3C behavior: once every track from a
@@ -725,20 +778,29 @@ async function startCapture() {
     // stays "live" (iOS shows its recording indicator) the whole time
     // this page is open in exchange for never prompting again after
     // the first press -- same trade every voice/call web app makes.
+    dlog(`Requesting mic (mediaDevices available: ${!!navigator.mediaDevices})`);
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    dlog(`Mic granted, tracks=${micStream.getTracks().length}`);
     const source = audioCtx.createMediaStreamSource(micStream);
     workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
     workletNode.port.onmessage = (e) => { if (capturing) capturedChunks.push(e.data); };
     source.connect(workletNode);
+    dlog("Mic graph connected");
   }
   capturedChunks = [];
   capturing = true;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    dlog(`WebSocket not open (readyState=${ws ? ws.readyState : "null"}), can't send utterance_start`, true);
+    return;
+  }
   ws.send(JSON.stringify({ type: "utterance_start", rate: audioCtx.sampleRate }));
+  dlog(`Sent utterance_start (rate=${audioCtx.sampleRate})`);
   talkBtn.dataset.state = "listening";
   talkBtn.textContent = "Listening...";
 }
 
 function stopCapture() {
+  dlog(`stopCapture called (capturing=${capturing})`);
   if (!capturing) return;
   capturing = false;
   // Deliberately NOT stopping micStream's tracks or disconnecting the
@@ -756,17 +818,19 @@ function stopCapture() {
   }
   ws.send(int16.buffer);
   ws.send(JSON.stringify({ type: "utterance_end" }));
+  dlog(`Sent utterance: ${total} samples`);
   talkBtn.textContent = "Sending...";
 }
 
 talkBtn.addEventListener("pointerdown", (e) => {
   e.preventDefault();
+  dlog(`pointerdown (button state=${talkBtn.dataset.state})`);
   if (talkBtn.dataset.state === "busy") return;
-  startCapture();
+  startCapture().catch((err) => dlog(`startCapture failed: ${err}`, true));
 });
-talkBtn.addEventListener("pointerup", (e) => { e.preventDefault(); stopCapture(); });
-talkBtn.addEventListener("pointercancel", (e) => { e.preventDefault(); stopCapture(); });
-talkBtn.addEventListener("pointerleave", (e) => { if (capturing) stopCapture(); });
+talkBtn.addEventListener("pointerup", (e) => { dlog("pointerup"); e.preventDefault(); stopCapture(); });
+talkBtn.addEventListener("pointercancel", (e) => { dlog("pointercancel"); e.preventDefault(); stopCapture(); });
+talkBtn.addEventListener("pointerleave", (e) => { dlog("pointerleave"); if (capturing) stopCapture(); });
 talkBtn.addEventListener("contextmenu", (e) => e.preventDefault());
 // NOTE: a touchstart preventDefault() was tried here as an extra
 // safety net against iOS text selection, but Apple's own Safari Web
