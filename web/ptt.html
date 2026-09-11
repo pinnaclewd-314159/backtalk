@@ -54,6 +54,18 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
   }
   #talk[data-state="listening"]{background:#ff3b30}
   #talk[data-state="busy"]{background:#555}
+  #unlock{
+    flex:0 0 auto;
+    margin:16px;
+    margin-bottom:calc(16px + env(safe-area-inset-bottom));
+    padding:24px;
+    font-size:1.4rem;
+    border-radius:16px;
+    border:none;
+    background:#2b6cff;
+    color:#fff;
+  }
+  #unlock.failed{background:#a33}
   /* Debug log panel -- no devtools needed, works on any device. Remove
      once the real device bugs found tonight are actually resolved;
      this is diagnostic scaffolding, not a permanent feature. */
@@ -77,7 +89,8 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
 <body>
 <div id="app">
   <div id="face"><canvas id="stage"></canvas></div>
-  <button id="talk" data-state="idle">Hold to talk</button>
+  <button id="unlock">Tap to enable microphone</button>
+  <button id="talk" data-state="idle" hidden>Hold to talk</button>
   <div id="dlog"></div>
 </div>
 <script src="core.js"></script>
@@ -678,6 +691,7 @@ if(AV.shot){
 <script>
 "use strict";
 const talkBtn = document.getElementById("talk");
+const unlockBtn = document.getElementById("unlock");
 const dlogEl = document.getElementById("dlog");
 const WIRE_RATE = 16000;
 
@@ -757,43 +771,30 @@ async function playChunk(arrayBuffer, rate) {
   src.start();
 }
 
-async function startCapture() {
-  dlog("startCapture: pointerdown fired");
-  let freshContext = false;
-  if (!audioCtx) {
-    dlog("Creating AudioContext");
+async function unlockAudio() {
+  // Everything one-time and async lives here, behind a single explicit
+  // tap-and-release -- confirmed via real device testing plus a real
+  // developer-reported fix (not a guess): iOS does NOT count
+  // touchstart/pointerdown as "user activation" for Web Audio
+  // unlocking, only the release (click/mouseup/touchend). A
+  // push-to-talk button needs to start recording ON PRESS, which can
+  // never itself be the unlocking gesture -- so unlocking has to be
+  // its own separate step, once, before the real button is usable.
+  try {
+    dlog("unlock: click fired");
     audioCtx = new AudioContext();
-    freshContext = true;
     dlog(`AudioContext created, sampleRate=${audioCtx.sampleRate}, state=${audioCtx.state}`);
-  }
-  if (audioCtx.state === "suspended") {
-    // MUST be the first await after creation, before anything else --
-    // iOS requires audio unlocking to happen within a synchronous call
-    // chain rooted at the user gesture (this pointerdown). Loading the
-    // worklet module first (the original order) is itself an await
-    // that breaks that chain, so by the time resume() ran, iOS no
-    // longer associated it with a real tap -- and per a confirmed Web
-    // Audio API spec issue, a resume() that isn't "allowed to start"
-    // is neither resolved nor rejected, just hangs forever with no
-    // error. Confirmed live via the debug panel: every press hung on
-    // exactly this line, silently, across three separate attempts.
-    dlog("AudioContext suspended, resuming (before worklet load, on purpose)");
-    await audioCtx.resume();
-    dlog(`AudioContext resumed, state=${audioCtx.state}`);
-  }
-  if (freshContext) {
+    if (audioCtx.state === "suspended") {
+      dlog("Resuming AudioContext");
+      await audioCtx.resume();
+      dlog(`AudioContext state after resume: ${audioCtx.state}`);
+    }
+    if (audioCtx.state !== "running") {
+      throw new Error(`AudioContext still not running (state=${audioCtx.state})`);
+    }
     dlog("Loading worklet module");
     await audioCtx.audioWorklet.addModule("pcm-processor.js");
     dlog("Worklet module loaded");
-  }
-  if (!micStream) {
-    // Requested once and kept alive for the rest of the page's life --
-    // documented WebKit/W3C behavior: once every track from a
-    // getUserMedia() call ends, the permission grant is revoked, so
-    // re-requesting per press means re-prompting per press. The mic
-    // stays "live" (iOS shows its recording indicator) the whole time
-    // this page is open in exchange for never prompting again after
-    // the first press -- same trade every voice/call web app makes.
     dlog(`Requesting mic (mediaDevices available: ${!!navigator.mediaDevices})`);
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     dlog(`Mic granted, tracks=${micStream.getTracks().length}`);
@@ -801,12 +802,24 @@ async function startCapture() {
     workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
     workletNode.port.onmessage = (e) => { if (capturing) capturedChunks.push(e.data); };
     source.connect(workletNode);
-    dlog("Mic graph connected");
+    dlog("Mic graph connected -- unlock complete");
+    unlockBtn.hidden = true;
+    talkBtn.hidden = false;
+  } catch (err) {
+    dlog(`Unlock failed: ${err}`, true);
+    unlockBtn.classList.add("failed");
+    unlockBtn.textContent = "Tap to try again";
   }
+}
+unlockBtn.addEventListener("click", unlockAudio);
+
+async function startCapture() {
+  dlog("startCapture: pointerdown fired");
   capturedChunks = [];
   capturing = true;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     dlog(`WebSocket not open (readyState=${ws ? ws.readyState : "null"}), can't send utterance_start`, true);
+    capturing = false;
     return;
   }
   ws.send(JSON.stringify({ type: "utterance_start", rate: audioCtx.sampleRate }));
