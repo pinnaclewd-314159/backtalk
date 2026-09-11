@@ -759,16 +759,32 @@ async function playChunk(arrayBuffer, rate) {
 
 async function startCapture() {
   dlog("startCapture: pointerdown fired");
+  let freshContext = false;
   if (!audioCtx) {
-    dlog("Creating AudioContext + loading worklet module");
+    dlog("Creating AudioContext");
     audioCtx = new AudioContext();
+    freshContext = true;
     dlog(`AudioContext created, sampleRate=${audioCtx.sampleRate}, state=${audioCtx.state}`);
-    await audioCtx.audioWorklet.addModule("pcm-processor.js");
-    dlog("Worklet module loaded");
   }
   if (audioCtx.state === "suspended") {
-    dlog("AudioContext suspended, resuming");
+    // MUST be the first await after creation, before anything else --
+    // iOS requires audio unlocking to happen within a synchronous call
+    // chain rooted at the user gesture (this pointerdown). Loading the
+    // worklet module first (the original order) is itself an await
+    // that breaks that chain, so by the time resume() ran, iOS no
+    // longer associated it with a real tap -- and per a confirmed Web
+    // Audio API spec issue, a resume() that isn't "allowed to start"
+    // is neither resolved nor rejected, just hangs forever with no
+    // error. Confirmed live via the debug panel: every press hung on
+    // exactly this line, silently, across three separate attempts.
+    dlog("AudioContext suspended, resuming (before worklet load, on purpose)");
     await audioCtx.resume();
+    dlog(`AudioContext resumed, state=${audioCtx.state}`);
+  }
+  if (freshContext) {
+    dlog("Loading worklet module");
+    await audioCtx.audioWorklet.addModule("pcm-processor.js");
+    dlog("Worklet module loaded");
   }
   if (!micStream) {
     // Requested once and kept alive for the rest of the page's life --
