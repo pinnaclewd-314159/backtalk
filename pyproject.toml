@@ -43,6 +43,13 @@ dependencies = [
     # must match torch's version+variant exactly or the import itself
     # throws (see torch note above).
     "torchaudio==2.9.1+cu130 ; sys_platform == 'win32'",
+    # Self-signed TLS cert generation for web_client.py's PTT server --
+    # getUserMedia() (browser mic capture) requires a secure context,
+    # which a LAN IP over plain HTTP never satisfies, on any browser.
+    # Was present as a transitive dep already (pulled in by something
+    # else) but never declared -- learned the hard way this morning
+    # that uv sync silently strips anything not declared here.
+    "cryptography>=42.0.0",
     # Used by tools/homeassistant.py's `registry`/`rename` commands
     # (HA's entity-registry API is WebSocket-only, no REST equivalent)
     # via this same venv. Was installed ad hoc and missing from this

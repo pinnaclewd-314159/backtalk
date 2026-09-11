@@ -22,3 +22,8 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+
+# Self-signed TLS cert/key for the web PTT client (web_client.py),
+# generated locally on first run -- machine-specific, and a private
+# key must never land in git regardless.
+.certs/

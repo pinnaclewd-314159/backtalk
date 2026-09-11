@@ -1061,6 +1061,7 @@ async def amain():
     await web_client.start_server(
         "0.0.0.0", CFG["web_ptt_port"], _on_satellite_utterance, web_registry,
         static_dir=Path(__file__).resolve().parent.parent / "web",
+        cert_dir=Path(__file__).resolve().parent.parent / ".certs",
         on_disconnect=_on_satellite_disconnect)
     log(f"[backtalk] PTT web server on port {CFG['web_ptt_port']}")
     typed_fut: asyncio.Future | None = None
