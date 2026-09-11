@@ -705,17 +705,18 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
 
 async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
                               log_channel: str | None = None):
-    """First sentence ships alone (fast start); the rest go in
-    2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    """Every sentence ships to the mouth solo, the moment it's ready —
+    fastest possible time-to-audio on each one. Traded away the old
+    2-sentence-breath batching (fuller chunks read with livelier
+    prosody; single short sentences can come out a touch flatter) for
+    that speed."""
     t0 = time.time()
     first = True
-    batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
     spoken: list[str] = []           # everything emitted, for cross_channel_log
 
     def emit(raw: str):
-        nonlocal first, batch, pending
+        nonlocal first, pending
         # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
         # lifted out here, never spoken, and published on the signal bus when
         # this chunk's audio starts (signals.direction). backtalk has no
@@ -735,16 +736,11 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
-            pending = []
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
-            batch.append(s)
-            if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
-                pending = []
-                batch = []
+        mouth.say_chunk(s, pending)
+        pending = []
 
     is_cloud = isinstance(brain, WarmBrain)
     stream = brain.ask_stream(text)
@@ -760,9 +756,6 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
             if is_cloud:
                 connectivity.force_offline()
             raise
-        if batch:
-            mouth.say_chunk(" ".join(batch), pending)
-            pending = []
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
