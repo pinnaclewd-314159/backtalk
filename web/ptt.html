@@ -695,6 +695,20 @@ const unlockBtn = document.getElementById("unlock");
 const dlogEl = document.getElementById("dlog");
 const WIRE_RATE = 16000;
 
+// Forwards every dlog() line to the server over the same WebSocket, so the
+// exact error text lands in backtalk.log instead of only on the phone's
+// screen -- added after a night of fixing this page blind, going only on
+// Sir relaying what he saw. Queued until the socket is open; flushed in
+// connect()'s onopen handler below, in order.
+let logQueue = [];
+function sendLog(entry) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ type: "client_log", ...entry })); } catch (e) { /* best-effort */ }
+  } else {
+    logQueue.push(entry);
+  }
+}
+
 function dlog(msg, isErr) {
   const line = document.createElement("div");
   if (isErr) line.className = "err";
@@ -703,6 +717,7 @@ function dlog(msg, isErr) {
   dlogEl.appendChild(line);
   dlogEl.scrollTop = dlogEl.scrollHeight;
   (isErr ? console.error : console.log)(msg);
+  sendLog({ msg: String(msg), isErr: !!isErr });
 }
 
 // Catches everything that would otherwise fail silently -- this is
@@ -733,7 +748,11 @@ function connect() {
   ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   ws.onmessage = onWsMessage;
-  ws.onopen = () => dlog("WebSocket open");
+  ws.onopen = () => {
+    // Flush queued lines first so server-side order matches on-page order.
+    while (logQueue.length) sendLog(logQueue.shift());
+    dlog("WebSocket open");
+  };
   ws.onerror = (e) => dlog(`WebSocket error: ${e.message || e.type}`, true);
   ws.onclose = (e) => { dlog(`WebSocket closed (code ${e.code}), reconnecting in 2s`, true); setTimeout(connect, 2000); };
 }

@@ -249,6 +249,14 @@ async def _handle_connection(ws, on_utterance, registry, on_disconnect):
                 log(f"[web_client] {name} malformed message, skipping: {e}")
                 continue
             mtype = msg.get("type")
+            if mtype == "client_log":
+                # Diagnostic forwarding from ptt.html's on-page #dlog panel --
+                # added 2026-09-11 after a night of fixing the iOS mic-unlock
+                # flow blind, going only on Sir relaying what the phone showed.
+                # This is the exact same text, straight into backtalk.log.
+                level = "ERR" if msg.get("isErr") else "log"
+                log(f"[web_client:client] {name} {level}: {msg.get('msg')}")
+                continue
             if mtype == "utterance_start":
                 conn._buffer = bytearray()
                 conn._capture_rate = int(msg.get("rate", WIRE_RATE))
