@@ -43,6 +43,14 @@ from backtalk.satellites import resample_pcm
 from backtalk.vlog import log
 
 WIRE_RATE = 16000
+# websockets.serve()'s own default max_size (1 MiB) rejects a real
+# utterance outright -- found live: a 24s/24kHz test clip (~1.16 MB)
+# got hard-disconnected with a 1009 "message too big" close. Same
+# wire-robustness reasoning as satellites.py's MAX_UTTERANCE_BYTES:
+# generous enough for any real utterance (60s at up to 48kHz mono
+# int16, the highest rate real browsers have reported live tonight,
+# plus headroom), but never unbounded.
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -276,7 +284,7 @@ async def start_server(host: str, port: int, on_utterance, registry,
 
     ssl_context = ensure_self_signed_cert(Path(cert_dir))
     server = await websockets.asyncio.server.serve(
-        handler, host, port, ssl=ssl_context,
+        handler, host, port, ssl=ssl_context, max_size=MAX_MESSAGE_BYTES,
         process_request=_make_process_request(Path(static_dir)))
     log(f"[web_client] PTT web server on https://{host}:{port}")
     return server
