@@ -758,11 +758,14 @@ talkBtn.addEventListener("pointerup", (e) => { e.preventDefault(); stopCapture()
 talkBtn.addEventListener("pointercancel", (e) => { e.preventDefault(); stopCapture(); });
 talkBtn.addEventListener("pointerleave", (e) => { if (capturing) stopCapture(); });
 talkBtn.addEventListener("contextmenu", (e) => e.preventDefault());
-// Belt-and-suspenders for iOS Safari specifically: some WebKit versions
-// start the text-selection gesture off the raw touchstart before (or
-// regardless of) pointerdown's preventDefault, so it has to be stopped
-// here too, on a non-passive listener.
-talkBtn.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
+// NOTE: a touchstart preventDefault() was tried here as an extra
+// safety net against iOS text selection, but Apple's own Safari Web
+// Content Guide documents that preventDefault() on touchstart
+// suppresses synthesized mousedown/mouseup/click on iOS -- and,
+// confirmed live, it suppressed pointerdown too, making the button
+// completely inert. Removed. The CSS fix (-webkit-user-select:none)
+// is what actually addresses the text-selection issue; this was an
+// unnecessary and harmful addition on top of it.
 
 connect();
 </script>
