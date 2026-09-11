@@ -717,12 +717,21 @@ async function startCapture() {
     await audioCtx.audioWorklet.addModule("pcm-processor.js");
   }
   if (audioCtx.state === "suspended") await audioCtx.resume();
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  const source = audioCtx.createMediaStreamSource(micStream);
-  workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+  if (!micStream) {
+    // Requested once and kept alive for the rest of the page's life --
+    // documented WebKit/W3C behavior: once every track from a
+    // getUserMedia() call ends, the permission grant is revoked, so
+    // re-requesting per press means re-prompting per press. The mic
+    // stays "live" (iOS shows its recording indicator) the whole time
+    // this page is open in exchange for never prompting again after
+    // the first press -- same trade every voice/call web app makes.
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const source = audioCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+    workletNode.port.onmessage = (e) => { if (capturing) capturedChunks.push(e.data); };
+    source.connect(workletNode);
+  }
   capturedChunks = [];
-  workletNode.port.onmessage = (e) => { if (capturing) capturedChunks.push(e.data); };
-  source.connect(workletNode);
   capturing = true;
   ws.send(JSON.stringify({ type: "utterance_start", rate: audioCtx.sampleRate }));
   talkBtn.dataset.state = "listening";
@@ -732,8 +741,8 @@ async function startCapture() {
 function stopCapture() {
   if (!capturing) return;
   capturing = false;
-  micStream.getTracks().forEach((t) => t.stop());
-  workletNode.disconnect();
+  // Deliberately NOT stopping micStream's tracks or disconnecting the
+  // worklet -- see the comment in startCapture() above.
 
   let total = 0;
   for (const c of capturedChunks) total += c.length;
