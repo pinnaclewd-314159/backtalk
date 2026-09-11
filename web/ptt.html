@@ -49,6 +49,7 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
     color:#fff;
     touch-action:none;
     -webkit-touch-callout:none;
+    -webkit-user-select:none;
     user-select:none;
   }
   #talk[data-state="listening"]{background:#ff3b30}
@@ -757,6 +758,11 @@ talkBtn.addEventListener("pointerup", (e) => { e.preventDefault(); stopCapture()
 talkBtn.addEventListener("pointercancel", (e) => { e.preventDefault(); stopCapture(); });
 talkBtn.addEventListener("pointerleave", (e) => { if (capturing) stopCapture(); });
 talkBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+// Belt-and-suspenders for iOS Safari specifically: some WebKit versions
+// start the text-selection gesture off the raw touchstart before (or
+// regardless of) pointerdown's preventDefault, so it has to be stopped
+// here too, on a non-passive listener.
+talkBtn.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
 
 connect();
 </script>
