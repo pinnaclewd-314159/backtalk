@@ -27,3 +27,17 @@ show.json
 # generated locally on first run -- machine-specific, and a private
 # key must never land in git regardless.
 .certs/
+
+# Local LLM weights for the offline fallback (models/Qwen3-4B-*.gguf, ~2.4GB).
+# Downloaded per-machine by the setup step, never redistributed through git --
+# and big enough that a stray `git add .` would otherwise try to commit it.
+models/
+
+# Runtime state written by the running voice line, same class as .voice_* above:
+# machine-local, regenerated constantly, and dirty in every user's repo forever
+# if tracked.
+.context_usage
+.rate_limit_alert
+
+# Local audio test fixture, regenerated on demand.
+gpu_test.wav
