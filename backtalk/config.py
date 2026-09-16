@@ -119,6 +119,11 @@ DEFAULTS = {
         # After a reply, how long (seconds) to keep listening for a
         # follow-up before requiring the wake word again.
         "grace_window_s": 9,
+        # After the wake word fires, how long (seconds) to wait for you
+        # to actually start speaking before giving up and re-arming.
+        # Without this the capture phase blocked forever on silence --
+        # see JarvisVault/07 - Resources/Backtalk Voice Line.md.
+        "capture_window_s": 8,
         "chime": True,
     },
     # Playback speed for the built-in voice: 1.0 is Kokoro's native
@@ -290,13 +295,19 @@ DISCIPLINE = (
     "sentences, and if a line could open a quarterly report, rewrite "
     "it like you're telling a friend. Keep replies to a few short "
     "sentences; go longer only when the question genuinely needs it. "
-    "No markdown, no lists, no code blocks, no emoji, no URLs. Say "
-    "numbers the way a human says them out loud — never raw figures "
-    "or symbols. NEVER SPEAK A FILE PATH: say the file, not its "
-    "address. 'the config' or 'ears dot py', never a string of "
-    "slashes and folder names read one by one — it is unbearable "
-    "aloud and carries no meaning by ear. Same for URLs and long "
-    "ids: name the thing, not the address. "
+    "No markdown, no lists, no code blocks, no emoji, no URLs, no "
+    "hashtags, no underscores — spell out whatever they'd represent "
+    "in words instead. Say numbers the way a human says them out "
+    "loud — never raw figures or symbols. NEVER WRITE A DIGITAL "
+    "TIME: no '13:55', no '1:55 PM', no 24-hour numerals ever, "
+    "especially not mixed with AM/PM ('13:55 PM' is nonsense the "
+    "engine reads as 'thirteen thousand fifty five'). Always spell "
+    "the time out in words: 'one fifty-five in the afternoon', 'a "
+    "quarter past nine at night'. NEVER SPEAK A FILE PATH: say the "
+    "file, not its address. 'the config' or 'ears dot py', never a "
+    "string of slashes and folder names read one by one — it is "
+    "unbearable aloud and carries no meaning by ear. Same for URLs "
+    "and long ids: name the thing, not the address. "
     "Skip any startup sequence; answer directly. "
     "VOICE CONSOLE FACTS, answer from these whenever the person asks "
     "you to change a voice-line setting: this session is controlled "

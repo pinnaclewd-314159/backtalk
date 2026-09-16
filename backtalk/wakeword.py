@@ -67,16 +67,37 @@ def get_detector() -> WakeDetector:
 
 
 def chime():
-    """A short two-tone beep confirming the wake word was heard.
+    """A short two-tone beep confirming the wake word was heard --
+    rising pitch (880Hz -> 1320Hz) for "started listening".
     Synthesized rather than a bundled asset file -- one less thing to
     ship or go missing."""
+    log("[wakeword] chime() called (start-listening tone)")
     t = np.linspace(0, 0.12, int(RATE * 0.12), endpoint=False)
     tone1 = 0.2 * np.sin(2 * np.pi * 880 * t)
     tone2 = 0.2 * np.sin(2 * np.pi * 1320 * t)
     gap = np.zeros(int(RATE * 0.02))
     audio = np.concatenate([tone1, gap, tone2]).astype(np.float32)
-    sd.play(audio, RATE)
-    sd.wait()
+    try:
+        sd.play(audio, RATE)
+        sd.wait()
+        log("[wakeword] chime() playback returned cleanly")
+    except Exception as e:
+        log(f"[wakeword] chime() playback FAILED: {e!r}")
+
+
+def chime_stop():
+    """A single lower tone confirming the mic has stopped listening --
+    deliberately the mirror of chime(): one descending tone (660Hz)
+    instead of a rising pair, so the two are never confused by ear."""
+    log("[wakeword] chime_stop() called (stop-listening tone)")
+    t = np.linspace(0, 0.12, int(RATE * 0.12), endpoint=False)
+    audio = (0.2 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
+    try:
+        sd.play(audio, RATE)
+        sd.wait()
+        log("[wakeword] chime_stop() playback returned cleanly")
+    except Exception as e:
+        log(f"[wakeword] chime_stop() playback FAILED: {e!r}")
 
 
 if __name__ == "__main__":

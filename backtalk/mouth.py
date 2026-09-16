@@ -69,14 +69,19 @@ _pipe_lock = threading.Lock()
 
 def _strip_markdown(text: str) -> str:
     """Voice-session backstop: the model is instructed never to emit
-    markdown in spoken replies, but it slips through occasionally, and
-    the TTS engines read punctuation like asterisks aloud literally
-    (`**word**` -> "asterisk asterisk word asterisk asterisk"). Strip
-    the offenders here so a lapse upstream never reaches the speaker.
-    Applied once in synth_stream(), ahead of every engine."""
+    markdown (or hashtags/underscores) in spoken replies, but it slips
+    through occasionally, and the TTS engines don't just read this
+    punctuation literally — asterisks come out as "asterisk asterisk
+    word asterisk asterisk", and hashtags/underscores have been
+    observed sending the engine off the rails entirely, not just
+    mispronouncing them. Strip the offenders here so a lapse upstream
+    never reaches the speaker. Applied once in synth_stream(), ahead
+    of every engine. Underscore becomes a space, not nothing — an
+    identifier like `stt_model` must not glue into "sttmodel"."""
     text = _MD_HEADER_RE.sub("", text)
     text = _MD_BULLET_RE.sub("", text)
-    return text.replace("*", "").replace("`", "")
+    text = text.replace("_", " ")
+    return text.replace("*", "").replace("`", "").replace("#", "")
 
 
 def _ensure_espeak():
