@@ -46,6 +46,18 @@ WIRE_RATE = 16000  # satellite mic/speaker rate, fixed by the firmware
 MAX_CHUNK_BYTES = 1024 * 1024              # 1 MB per audio-chunk payload
 MAX_UTTERANCE_BYTES = 60 * WIRE_RATE * 2   # 60s of 16kHz mono int16 (~1.92 MB)
 
+# 2026-09-15: a satellite that resets (power blip, or -- confirmed live --
+# closing a debug serial connection to it) without sending a TCP FIN leaves
+# reader.readline() awaiting bytes that are never coming. Nothing in this
+# file's own logic ever revisits that await, so the connection stays
+# ESTABLISHED on this end forever: never logged as closed, never removed
+# from the registry, and if it happened to own the turn lock, that lock
+# never releases either. A real satellite is never silent this long mid-
+# connection -- it streams a chunk every ~20-50ms during an utterance and
+# otherwise connects fresh per wake-word episode -- so any gap this long
+# between messages means the peer is gone, not just slow.
+IDLE_READ_TIMEOUT_S = 30.0
+
 
 class TurnLock:
     """Tracks which source (the string "local", or a SatelliteConnection)
@@ -111,6 +123,14 @@ class SatelliteConnection:
     # True once this utterance blew a wire-robustness ceiling: the rest of
     # it is discarded (and never transcribed) until the next audio-start.
     _dropping: bool = False
+    # True for the duration of send_reply() below. A satellite legitimately
+    # sends nothing while it is only receiving/playing a reply -- exactly
+    # the same silence IDLE_READ_TIMEOUT_S exists to catch on a genuinely
+    # dead connection. Without this flag a reply whose total
+    # generation+delivery time exceeds IDLE_READ_TIMEOUT_S gets its
+    # connection torn down mid-stream (found 2026-09-15: a 6-sentence
+    # reply cut off with reply audio-stop never sent).
+    _replying: bool = False
 
     def __hash__(self):
         return id(self)
@@ -186,7 +206,22 @@ async def handle_connection(reader: asyncio.StreamReader,
     log(f"[satellites] {name} connected")
     try:
         while True:
-            msg = await _read_message(reader)
+            try:
+                msg = await asyncio.wait_for(_read_message(reader),
+                                              timeout=IDLE_READ_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                if conn._replying:
+                    # Expected silence, not a dead connection: the
+                    # satellite is only receiving/playing send_reply()'s
+                    # audio right now and has nothing of its own to send
+                    # until that finishes. Re-arm the read instead of
+                    # tearing the connection down under it -- see
+                    # SatelliteConnection._replying's own comment.
+                    continue
+                log(f"[satellites] {name} idle timeout "
+                    f"({IDLE_READ_TIMEOUT_S:.0f}s no data) -- "
+                    f"dropping stale connection")
+                break
             if msg is None:
                 break
             msg_type = msg.get("type")
@@ -277,7 +312,14 @@ async def send_reply(conn: SatelliteConnection, rated_pcm_chunks) -> bool:
     clean the connection out of the registry when this happens, per the
     spec: "one satellite's failure never takes the shared backtalk
     process down."
+
+    Sets conn._replying for the whole call (cleared in `finally`, so it
+    always clears on any exit path) -- see the field's own comment for
+    why: handle_connection()'s idle-read loop needs to know a reply is
+    actively streaming so it doesn't mistake the satellite's expected
+    silence during that window for a dead connection.
     """
+    conn._replying = True
     try:
         conn.writer.write(
             b'{"type": "audio-start", "data": {"rate": %d, "width": 2, "channels": 1}}\n'
@@ -311,6 +353,8 @@ async def send_reply(conn: SatelliteConnection, rated_pcm_chunks) -> bool:
     except (ConnectionError, OSError) as e:
         log(f"[satellites] {conn.name} write failed mid-reply: {e}")
         return False
+    finally:
+        conn._replying = False
 
 
 async def send_stop(conn: SatelliteConnection) -> None:

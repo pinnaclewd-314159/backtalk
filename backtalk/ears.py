@@ -31,6 +31,7 @@ import platform
 import re
 import sys
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -371,10 +372,38 @@ def warm():
     return _model
 
 
-def transcribe(pcm: np.ndarray) -> str:
+# Standard whisper hallucination signals, not invented thresholds: 0.6 for
+# no_speech_prob is the common community heuristic for "this segment is
+# probably not speech at all"; 2.4 for compression_ratio is OpenAI's own
+# whisper CLI default (a highly repetitive decode, e.g. a phrase looped
+# many times, compresses far better than real text and trips this).
+# 2026-09-15: found the satellite's raw-amplitude VAD (a much cruder gate
+# than webrtcvad's own speech-onset detection the local mic paths use)
+# lets a lot of near-silent captures through — Whisper doesn't return an
+# empty string on those, it invents short plausible-sounding filler
+# ("Thanks for watching!", "Thank you very much.") that then gets spoken
+# to as a genuine command. Measured live: ~46% of satellite trigger
+# attempts that morning/afternoon came back this way.
+NO_SPEECH_PROB_THRESHOLD = 0.6
+COMPRESSION_RATIO_THRESHOLD = 2.4
+
+
+def transcribe(pcm: np.ndarray, *, reject_hallucinations: bool = False) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
     if nothing remains, it was silence.
+
+    `reject_hallucinations`: when True, a decode that looks like
+    Whisper inventing text over near-silence (high no_speech_prob) or
+    looping on itself (high compression_ratio) returns "" instead of
+    the hallucinated text -- same contract callers already use for real
+    silence, so no caller-side change needed beyond opting in. Off by
+    default: the local mic paths already gate on real speech onset
+    (webrtcvad) before ever reaching here, so they rarely hit this case
+    and a wrong rejection there would silently drop a genuine utterance.
+    The satellite/web-PTT path (main.py's _on_satellite_utterance) is
+    the one that needs it — its VAD is a simple energy threshold with no
+    speech-content awareness at all.
 
     Serialized process-wide (_stt_lock): several callers can reach the
     one global model at once now that satellites are a thing. The lock
@@ -393,8 +422,45 @@ def transcribe(pcm: np.ndarray) -> str:
             segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
             # faster-whisper is lazy: the generator must be drained INSIDE
             # the lock or the actual inference would run outside it.
+            segments = list(segments)
+            if reject_hallucinations and segments:
+                avg_no_speech = (sum(s.no_speech_prob for s in segments)
+                                  / len(segments))
+                looping = any(s.compression_ratio > COMPRESSION_RATIO_THRESHOLD
+                              for s in segments)
+                if avg_no_speech > NO_SPEECH_PROB_THRESHOLD or looping:
+                    return ""
             text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
+
+
+def _read_frame(stream, n, abort=None):
+    """Poll for n frames instead of trusting a blocking read.
+
+    An InputStream torn down out from under us by
+    _reopen_after_device_change (another call's device-change rebuild
+    closes every open stream, this one included -- see that function's
+    docstring) can leave stream.read() blocking forever with no
+    exception ever raised. That is exactly the "wake word never fires
+    again, and there's no error either" failure: the mic looks open,
+    the loop looks alive, and it simply never hears another word.
+
+    Checking stream.active first -- the same guard Mouth._get_out uses
+    for its output stream -- catches that promptly instead of hanging.
+    Returns (block, overflow), or None if abort() fired first.
+    """
+    while stream.read_available < n:
+        if abort and abort():
+            return None
+        try:
+            alive = stream.active
+        except Exception:
+            alive = False
+        if not alive:
+            raise RuntimeError(
+                "mic stream died -- device rebuilt underneath it")
+        time.sleep(0.005)
+    return stream.read(n)
 
 
 class Ears:
@@ -419,10 +485,11 @@ class Ears:
 
         with _open_mic() as stream:
             while True:
-                block, _ = stream.read(FRAME_LEN)
-                elapsed += FRAME_MS / 1000
-                if abort and abort():
+                got = _read_frame(stream, FRAME_LEN, abort)
+                if got is None:
                     return None
+                block, _ = got
+                elapsed += FRAME_MS / 1000
                 if timeout_s and elapsed > timeout_s and not in_utterance:
                     return None
                 mono = block[:, 0].copy()
@@ -476,9 +543,10 @@ def wait_for_wake(gate=None, abort=None, detector=None) -> bool:
     threshold = float(CFG.get("wake_word", {}).get("threshold", 0.5))
     with _open_mic(blocksize=wakeword.FRAME_LEN) as stream:
         while True:
-            if abort and abort():
+            got = _read_frame(stream, wakeword.FRAME_LEN, abort)
+            if got is None:
                 return False
-            block, _ = stream.read(wakeword.FRAME_LEN)
+            block, _ = got
             if gate and gate():
                 continue
             mono = block[:, 0].copy()

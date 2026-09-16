@@ -755,6 +755,19 @@ async def _speak_reply_local(brain: WarmBrain, mouth: Mouth, text: str,
         except Exception:
             if is_cloud:
                 connectivity.force_offline()
+                # 2026-09-14: a _CLOUD_TURN_TIMEOUT_S timeout used to just
+                # force_offline() and re-raise, leaving the SDK's own
+                # turn un-interrupted and self._dirty stuck True. That
+                # zombie stream then sat abandoned until the NEXT unrelated
+                # turn's reset_turn() tried to drain it, found it long dead,
+                # and paid for this timeout by rebuilding the whole session
+                # (losing conversation memory) up to an hour later instead
+                # of right here. Interrupt it now, at the moment of failure,
+                # same as the CancelledError path below already does.
+                try:
+                    await brain.interrupt()
+                except Exception:
+                    pass
             raise
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
@@ -798,8 +811,8 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
     # this file (e.g. inside make_permission_gate).
     t0 = time.time()
     speaking = False
-    if isinstance(source, web_client.WebConnection):
-        asyncio.create_task(web_client.push_state(source, "thinking"))
+    if isinstance(conn, web_client.WebConnection):
+        asyncio.create_task(web_client.push_state(conn, "thinking"))
 
     def _mark_speaking():
         # The first byte of real audio is where a satellite turn stops
@@ -810,47 +823,103 @@ async def _speak_reply_satellite(brain: WarmBrain, text: str, conn):
             speaking = True
             signals.static_stop()
             signals.set_state("speaking")
-            if isinstance(source, web_client.WebConnection):
-                asyncio.create_task(web_client.push_state(source, "speaking"))
+            if isinstance(conn, web_client.WebConnection):
+                asyncio.create_task(web_client.push_state(conn, "speaking"))
 
     async def _rated_chunks():
-        """(rate, pcm) for the WHOLE reply, in order, as it renders."""
+        """(rate, pcm) for the WHOLE reply, in order, as it renders.
+
+        2026-09-14: rendering used to happen strictly one sentence at a
+        time, in the same coroutine that yields chunks out to send_reply --
+        so while sentence N+1 was being synthesized, nothing was available
+        to send, and a satellite playing sentence N dry-ran its buffer and
+        went dead silent for however long that render took (confirmed live:
+        a multi-second gap mid-reply on real hardware). synth_stream()
+        itself is also a plain blocking generator, not async, so it was
+        stalling the whole event loop while it ran besides.
+        A background producer task now renders one sentence ahead of what's
+        being drained below, off the event loop (asyncio.to_thread), and
+        pushes finished (rate, pcm) chunks through a queue. As long as one
+        sentence's render finishes before the previous sentence is done
+        playing out, the gap disappears entirely; it only reappears if a
+        single sentence is unusually slow to render, same as before."""
         stream = brain.ask_stream(text)
         if isinstance(brain, WarmBrain):
             stream = _with_timeout(stream, _CLOUD_TURN_TIMEOUT_S)
-        try:
-            async for sentence in stream:
-                # Directions are stripped, never spoken. There is no local
-                # signal-bus listener relevant to a satellite's room, so
-                # they are dropped rather than published against audio
-                # nobody here can hear.
-                raw = _DIRECTION_TAG.sub(" ", sentence)
-                s = " ".join(raw.replace("`", "").split()).strip()
-                if not s:
-                    continue
-                log(f"[{NAME}->{conn.name}] ({time.time()-t0:.1f}s) {s}")
-                for rate, pcm in synth_stream(s):
-                    _mark_speaking()
-                    yield rate, pcm
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            # A genuine mid-turn failure (not an interrupt). The spec
-            # requires a satellite-bound turn to SAY that something broke
-            # — otherwise the person in the other room just hears silence
-            # forever with no idea why. The apology rides INSIDE the same
-            # envelope, so the reply still ends with exactly one
-            # audio-stop. (If the socket is what died, send_reply has
-            # already closed this generator and none of this runs.)
-            log(f"[{NAME}] speak_reply failed: {e!r}")
-            if isinstance(brain, WarmBrain):
-                connectivity.force_offline()
+
+        chunk_queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+        _DONE = object()
+
+        def _render_sentence(s: str):
+            # Runs off the event loop (asyncio.to_thread below) -- fully
+            # materializes one sentence's audio so the producer can move on
+            # to rendering the next sentence the instant this one's queued,
+            # rather than trickling it out chunk by chunk itself.
+            return list(synth_stream(s))
+
+        async def _producer():
             try:
-                for rate, pcm in synth_stream(
-                        "Sorry, something went wrong on my end."):
-                    _mark_speaking()
-                    yield rate, pcm
-            except Exception:
+                async for sentence in stream:
+                    # Directions are stripped, never spoken. There is no
+                    # local signal-bus listener relevant to a satellite's
+                    # room, so they are dropped rather than published
+                    # against audio nobody here can hear.
+                    raw = _DIRECTION_TAG.sub(" ", sentence)
+                    s = " ".join(raw.replace("`", "").split()).strip()
+                    if not s:
+                        continue
+                    log(f"[{NAME}->{conn.name}] ({time.time()-t0:.1f}s) {s}")
+                    for rate, pcm in await asyncio.to_thread(_render_sentence, s):
+                        await chunk_queue.put((rate, pcm))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # A genuine mid-turn failure (not an interrupt). The spec
+                # requires a satellite-bound turn to SAY that something
+                # broke -- otherwise the person in the other room just
+                # hears silence forever with no idea why. The apology
+                # rides INSIDE the same envelope, so the reply still ends
+                # with exactly one audio-stop. (If the socket is what
+                # died, send_reply has already closed this generator and
+                # none of this runs.)
+                log(f"[{NAME}] speak_reply failed: {e!r}")
+                if isinstance(brain, WarmBrain):
+                    connectivity.force_offline()
+                    # Same zombie-stream fix as _speak_reply_local: interrupt
+                    # the SDK's turn right here instead of leaving it dirty
+                    # for reset_turn() to discover, and fail to recover, far
+                    # later.
+                    try:
+                        await brain.interrupt()
+                    except Exception:
+                        pass
+                try:
+                    apology = await asyncio.to_thread(
+                        _render_sentence, "Sorry, something went wrong on my end.")
+                    for rate, pcm in apology:
+                        await chunk_queue.put((rate, pcm))
+                except Exception:
+                    pass
+            finally:
+                await chunk_queue.put(_DONE)
+
+        producer_task = asyncio.create_task(_producer())
+        try:
+            while True:
+                item = await chunk_queue.get()
+                if item is _DONE:
+                    break
+                rate, pcm = item
+                _mark_speaking()
+                yield rate, pcm
+        finally:
+            # If the consumer side stops early (interrupt, socket died),
+            # don't leave the producer rendering into a queue nobody's
+            # draining anymore.
+            producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):
                 pass
 
     gen = _rated_chunks()
@@ -1021,9 +1090,21 @@ async def amain():
         # transcribe() serializes internally (ears._STT_LOCK): one global
         # model instance, and this can now run alongside the local mic's
         # own transcription or a second satellite's.
-        text = await loop.run_in_executor(None, transcribe, pcm)
+        #
+        # reject_hallucinations=True: this path's VAD (the satellite
+        # firmware's own raw-amplitude threshold) has no speech-content
+        # awareness, unlike the local mic paths' webrtcvad gating, so it
+        # regularly lets near-silent captures through. Whisper doesn't
+        # return "" on those -- it invents short plausible filler text
+        # ("Thanks for watching!") that would otherwise be spoken to as
+        # a genuine command. See ears.transcribe()'s own docstring.
+        text = await loop.run_in_executor(
+            None, lambda: transcribe(pcm, reject_hallucinations=True))
         if text:
             await handle(text, source=conn)
+        else:
+            log(f"[satellites] {conn.name} transcribed to nothing "
+                f"({pcm.size / 16000:.1f}s audio) -- silence or hallucination, dropped")
 
     def _on_satellite_disconnect(conn):
         """A satellite that vanishes (reboot, network hiccup) while it
@@ -1355,6 +1436,7 @@ async def amain():
     WAKE_ENABLED = (bool(CFG.get("wake_word", {}).get("enabled", False))
                      and _WAKE["ready"])
     GRACE_S = float(CFG.get("wake_word", {}).get("grace_window_s", 9))
+    CAPTURE_S = float(CFG.get("wake_word", {}).get("capture_window_s", 8))
     CHIME_ON = bool(CFG.get("wake_word", {}).get("chime", True))
 
     try:
@@ -1409,8 +1491,12 @@ async def amain():
                                 gate=mic_gate,
                                 abort=lambda: _MIC["gen"] != g)))
                     else:
-                        t = GRACE_S if (WAKE_ENABLED and
-                                        mic_state == "grace") else None
+                        if WAKE_ENABLED and mic_state == "grace":
+                            t = GRACE_S
+                        elif WAKE_ENABLED and mic_state == "capture":
+                            t = CAPTURE_S
+                        else:
+                            t = None
                         mic_fut = loop.run_in_executor(
                             None, lambda g=g, t=t: (g, "listen",
                                 ears.listen_once(
@@ -1458,8 +1544,8 @@ async def amain():
                                                # listen for a follow-up after
                     if not await handle(text):
                         return
-                elif WAKE_ENABLED and mic_state == "grace":
-                    mic_state = "wake"        # grace window timed out: re-arm
+                elif WAKE_ENABLED and mic_state in ("grace", "capture"):
+                    mic_state = "wake"        # window timed out: re-arm
                 continue
             if press_fut in done:
                 press_fut.result(); press_fut = None
