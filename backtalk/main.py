@@ -1105,6 +1105,10 @@ async def amain():
         else:
             log(f"[satellites] {conn.name} transcribed to nothing "
                 f"({pcm.size / 16000:.1f}s audio) -- silence or hallucination, dropped")
+            # Without this the firmware sits in its reply read until the 30s
+            # idle timeout, and a wake word spoken meanwhile starts too late
+            # to catch its own command (seen 2026-09-16).
+            await _send_stop(conn)
 
     def _on_satellite_disconnect(conn):
         """A satellite that vanishes (reboot, network hiccup) while it
@@ -1296,6 +1300,10 @@ async def amain():
                f"(turn owned by {getattr(owner, 'name', owner)})")
             if isinstance(source, web_client.WebConnection):
                 await web_client.push_state(source, "busy")
+            else:
+                # Same reason as the empty-transcription drop: don't leave the
+                # satellite waiting on a reply that is never coming.
+                await satellites.send_stop(source)
             return True
         if source == "local":
             # always succeeds; may steal from a satellite
