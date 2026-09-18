@@ -103,6 +103,7 @@ class WarmBrain:
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 resume=rid,
+                max_buffer_size=10 * 1024 * 1024,
             )
         if resume:
             try:
