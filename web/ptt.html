@@ -30,6 +30,21 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Jarvis</title>
+<!-- Home-screen install. iOS re-asks for the microphone on every page
+     LOAD under Safari's default Ask policy, and no page-level code can
+     change that: the page already holds a single long-lived stream and
+     never stops its tracks, which is the whole of what a page can do.
+     Installed standalone, the app stays resident, so a grant covers a
+     launch rather than a navigation. display:standalone also drops
+     Safari's chrome, which is what makes a phone or a wall tablet read
+     as a Jarvis panel instead of a browser tab. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Jarvis">
+<meta name="theme-color" content="#050509">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="manifest" href="manifest.webmanifest">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{background:#050509;overflow:hidden;height:100dvh}
@@ -37,39 +52,74 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
   #app{display:flex;flex-direction:column;height:100dvh}
   #face{flex:1 1 auto;position:relative;min-height:0}
   canvas#stage{position:absolute;inset:0;width:100%;height:100%;display:block}
+  /* HUD panel button. Chamfered corners cut with clip-path; the outline
+     is an INSET box-shadow rather than a border, because clip-path cuts
+     borders off but clips an inset shadow to the same silhouette. The
+     glow uses drop-shadow for the same reason -- it follows the clipped
+     shape, where box-shadow would halo the original rectangle.
+     Colours are the radial face's own: blue at rest, the face's orange
+     accent while held. Red is deliberately NOT used: it means ALERT on
+     the face, and a button that is working correctly should not shout. */
   #talk{
     flex:0 0 auto;
     margin:16px;
     margin-bottom:calc(16px + env(safe-area-inset-bottom));
-    padding:24px;
-    font-size:1.4rem;
-    border-radius:16px;
+    padding:22px 24px 20px;
+    font:600 1.05rem/1 system-ui,sans-serif;
+    text-transform:uppercase;
+    letter-spacing:.34em;
+    text-indent:.34em;           /* letter-spacing pads the right of the
+                                    last glyph only, which shifts the text
+                                    left of centre; this puts it back. */
     border:none;
-    background:#2b6cff;
-    color:#fff;
+    color:#cfe0ff;
+    background:
+      repeating-linear-gradient(90deg,
+        rgba(120,170,255,.55) 0 10px, transparent 10px 18px) top/100% 3px no-repeat,
+      linear-gradient(180deg, rgba(43,108,255,.30), rgba(43,108,255,.10));
+    clip-path:polygon(18px 0, 100% 0, 100% calc(100% - 18px),
+                      calc(100% - 18px) 100%, 0 100%, 0 18px);
+    box-shadow:inset 0 0 0 1px rgba(150,195,255,.85),
+               inset 0 0 22px rgba(43,108,255,.35);
+    filter:drop-shadow(0 0 10px rgba(43,108,255,.45));
+    transition:color .15s ease, background .15s ease;
     touch-action:none;
     -webkit-touch-callout:none;
     -webkit-user-select:none;
     user-select:none;
   }
-  #talk[data-state="listening"]{background:#ff3b30}
-  #talk[data-state="busy"]{background:#555}
-  #unlock{
-    flex:0 0 auto;
-    margin:16px;
-    margin-bottom:calc(16px + env(safe-area-inset-bottom));
-    padding:24px;
-    font-size:1.4rem;
-    border-radius:16px;
-    border:none;
-    background:#2b6cff;
-    color:#fff;
+  #talk[data-state="listening"]{
+    color:#ffe3ad;
+    background:
+      repeating-linear-gradient(90deg,
+        rgba(255,190,70,.75) 0 10px, transparent 10px 18px) top/100% 3px no-repeat,
+      linear-gradient(180deg, rgba(255,190,70,.28), rgba(255,190,70,.08));
+    box-shadow:inset 0 0 0 1px rgba(255,205,120,.95),
+               inset 0 0 26px rgba(255,190,70,.40);
+    animation:talkpulse 1.1s ease-in-out infinite;
   }
-  #unlock.failed{background:#a33}
-  /* Debug log panel -- no devtools needed, works on any device. Remove
-     once the real device bugs found tonight are actually resolved;
-     this is diagnostic scaffolding, not a permanent feature. */
+  #talk[data-state="busy"],#talk[data-state="disarmed"]{
+    color:#8f9bb3;
+    background:linear-gradient(180deg, rgba(120,140,180,.18), rgba(120,140,180,.06));
+    box-shadow:inset 0 0 0 1px rgba(150,170,200,.50);
+    filter:none;
+  }
+  @keyframes talkpulse{
+    0%,100%{filter:drop-shadow(0 0 12px rgba(255,190,70,.45))}
+    50%    {filter:drop-shadow(0 0 22px rgba(255,190,70,.80))}
+  }
+  @media (prefers-reduced-motion:reduce){
+    #talk[data-state="listening"]{animation:none}
+  }
+  /* Debug log panel -- no devtools needed, works on any device. HIDDEN
+     by default since 2026-09-18: it is diagnostic scaffolding, not
+     furniture, and it made the face resize as it filled. Show it with
+     ?debug=1, or let it reveal itself (see dlog()). Deliberately NOT
+     deleted -- the forwarding half of it is what ended eight days of
+     blind guessing, and the on-screen half is the only witness when the
+     socket is down. */
   #dlog{
+    display:none;
     flex:0 0 auto;
     max-height:30vh;
     overflow-y:auto;
@@ -84,13 +134,58 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
     user-select:text;
   }
   #dlog .err{color:#ff6b6b}
+  #dlog.show{display:block}
+  /* Plan-usage readout. Ported from ai-visualizer's core.js rather than
+     rewritten, so the phone and the desktop face cannot drift apart.
+     Centred at the top on a phone, moving to the top right once there is
+     width for it. Offset by the safe-area inset because the installed
+     app draws under the status bar and the Dynamic Island, which is the
+     one thing the desktop widget never had to think about. */
+  #usage{
+    position:fixed;
+    top:calc(env(safe-area-inset-top) + 10px);
+    /* A full-width band with centred text, NOT a shrink-to-fit box
+       centred by transform. The shrink-to-fit version wrapped onto three
+       lines on a real iPhone while there was obvious room either side:
+       its width is negotiated from content, not from the viewport, so
+       max-width never governed the line box the way it appeared to in a
+       headless render. Pinning both edges makes the available width
+       explicit, and nowrap plus a clamped size then actually decides. */
+    left:12px;
+    right:12px;
+    text-align:center;
+    white-space:nowrap;
+    overflow:hidden;
+    z-index:20;
+    display:none;
+    font:700 12px/1.4 'SF Mono',Menlo,Consolas,monospace;
+    /* One line at any phone width. Reads ~11px on a modern iPhone, so a
+       pixel under the desktop face rather than a different design. */
+    font-size:clamp(9px, 2.7vw, 12px);
+    letter-spacing:.02em;
+    /* iOS inflates text in some layouts unless told not to, which is the
+       other half of why this rendered larger on the phone than in any
+       test render here. */
+    -webkit-text-size-adjust:100%;
+    text-shadow:0 0 8px currentColor;
+    pointer-events:none;   /* must never eat a tap meant for the face */
+  }
+  @media (min-width:600px){
+    #usage{
+      left:auto;
+      right:16px;
+      text-align:right;
+      font-size:12px;
+      letter-spacing:.05em;
+    }
+  }
 </style>
 </head>
 <body>
 <div id="app">
   <div id="face"><canvas id="stage"></canvas></div>
-  <button id="unlock">Tap to enable microphone</button>
-  <button id="talk" data-state="idle" hidden>Hold to talk</button>
+  <button id="talk" data-state="disarmed">Arming</button>
+  <div id="usage"></div>
   <div id="dlog"></div>
 </div>
 <script src="core.js"></script>
@@ -691,9 +786,34 @@ if(AV.shot){
 <script>
 "use strict";
 const talkBtn = document.getElementById("talk");
-const unlockBtn = document.getElementById("unlock");
 const dlogEl = document.getElementById("dlog");
+// Scaffolding, shown on request only: ?debug=1. The half that matters
+// (forwarding every line to backtalk.log) is always on and costs
+// nothing on screen.
+if (new URLSearchParams(location.search).has("debug")) dlogEl.classList.add("show");
 const WIRE_RATE = 16000;
+
+// Declared FIRST, above anything that can read them. sendLog() below
+// touches `ws`, and dlog() calls sendLog() at the top level of this
+// script -- so if these declarations sit below that call, `ws` is in the
+// temporal dead zone and the page dies on load. That exact ordering bug
+// shipped on 2026-09-11 and cost eight days. Keep this block at the top.
+let ws = null;
+let audioCtx = null;
+let workletNode = null;
+let micStream = null;
+let capturing = false;
+let capturedChunks = [];
+let playCtx = null;
+let pendingRate = WIRE_RATE;
+// Where the next reply chunk should START, in playCtx's own clock.
+// Reply audio arrives FASTER than real time (Voicebox synthesises a
+// sentence quicker than it takes to speak it), so starting each chunk
+// on arrival made every sentence after the first talk over the one
+// before it. Found live 2026-09-18, on a limerick.
+let playCursor = 0;
+// Scheduled-but-not-finished sources, so a new press can cut them off.
+let playing = [];
 
 // Forwards every dlog() line to the server over the same WebSocket, so the
 // exact error text lands in backtalk.log instead of only on the phone's
@@ -702,10 +822,22 @@ const WIRE_RATE = 16000;
 // connect()'s onopen handler below, in order.
 let logQueue = [];
 function sendLog(entry) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify({ type: "client_log", ...entry })); } catch (e) { /* best-effort */ }
-  } else {
-    logQueue.push(entry);
+  // Nothing in here may throw. This is the diagnostic path, and on
+  // 2026-09-11 it killed the whole page: it read `ws` above that
+  // variable's own declaration, so the top-level dlog() call threw a
+  // TDZ ReferenceError, connect() never ran, the talk button never got
+  // its listeners, and the forwarding added to make failures visible
+  // could not report the failure it had itself caused. Eight days of
+  // silence, and zero successful utterances, came from these lines.
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "client_log", ...entry }));
+    } else {
+      logQueue.push(entry);
+    }
+  } catch (e) {
+    // Best-effort by design: a broken log line must never take down
+    // the page it exists to diagnose.
   }
 }
 
@@ -716,6 +848,11 @@ function dlog(msg, isErr) {
   line.textContent = `[${t}] ${msg}`;
   dlogEl.appendChild(line);
   dlogEl.scrollTop = dlogEl.scrollHeight;
+  // If something fails BEFORE the socket is open, the server never hears
+  // about it and this panel is the only witness left -- which is exactly
+  // how a fatal page error went unseen for eight days. Reveal itself in
+  // precisely that case, and only that case.
+  if (isErr && (!ws || ws.readyState !== WebSocket.OPEN)) dlogEl.classList.add("show");
   (isErr ? console.error : console.log)(msg);
   sendLog({ msg: String(msg), isErr: !!isErr });
 }
@@ -731,15 +868,6 @@ window.addEventListener("unhandledrejection", (e) => {
   dlog(`Unhandled rejection: ${e.reason && e.reason.stack ? e.reason.stack : e.reason}`, true);
 });
 dlog(`Page loaded. protocol=${location.protocol} host=${location.host} mediaDevices=${!!navigator.mediaDevices}`);
-
-let ws = null;
-let audioCtx = null;
-let workletNode = null;
-let micStream = null;
-let capturing = false;
-let capturedChunks = [];
-let playCtx = null;
-let pendingRate = WIRE_RATE;
 
 function connect() {
   const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -764,13 +892,12 @@ async function onWsMessage(ev) {
       talkBtn.dataset.state = msg.state;
       AV.setRaw({ state: msg.state === "busy" ? "idle" : msg.state,
                   alert: msg.state === "busy" });
-      talkBtn.textContent = msg.state === "busy" ? "Jarvis is busy"
-        : msg.state[0].toUpperCase() + msg.state.slice(1) + "...";
+      talkBtn.textContent = msg.state === "busy" ? "BUSY" : msg.state.toUpperCase();
     } else if (msg.type === "audio-chunk") {
       pendingRate = msg.rate;
     } else if (msg.type === "audio-stop") {
       talkBtn.dataset.state = "idle";
-      talkBtn.textContent = "Hold to talk";
+      talkBtn.textContent = "HOLD TO TALK";
     }
   } else {
     await playChunk(ev.data, pendingRate);
@@ -787,7 +914,34 @@ async function playChunk(arrayBuffer, rate) {
   const src = playCtx.createBufferSource();
   src.buffer = buf;
   src.connect(playCtx.destination);
-  src.start();
+
+  // Queue end to end rather than all at once. currentTime is the floor:
+  // if playback has already drained (a pause between sentences, or the
+  // very first chunk), start now instead of scheduling in the past,
+  // which the Web Audio API silently treats as "now" anyway but would
+  // leave the cursor lagging behind real time and stack every later
+  // chunk on top of it.
+  const startAt = Math.max(playCtx.currentTime, playCursor);
+  src.start(startAt);
+  playCursor = startAt + buf.duration;
+
+  playing.push(src);
+  src.onended = () => {
+    const i = playing.indexOf(src);
+    if (i !== -1) playing.splice(i, 1);
+  };
+}
+
+
+// Cuts off whatever is still queued. Called when Sir presses to talk
+// again: pressing the button IS the interrupt, and waiting out a reply
+// he has already abandoned is the wrong behaviour.
+function stopPlayback() {
+  for (const src of playing) {
+    try { src.stop(); } catch (e) { /* already ended */ }
+  }
+  playing = [];
+  playCursor = 0;
 }
 
 async function unlockAudio() {
@@ -800,7 +954,7 @@ async function unlockAudio() {
   // never itself be the unlocking gesture -- so unlocking has to be
   // its own separate step, once, before the real button is usable.
   try {
-    dlog("unlock: click fired");
+    dlog("arming: starting (auto on load, or a tap if iOS refused)");
     audioCtx = new AudioContext();
     dlog(`AudioContext created, sampleRate=${audioCtx.sampleRate}, state=${audioCtx.state}`);
     if (audioCtx.state === "suspended") {
@@ -821,19 +975,46 @@ async function unlockAudio() {
     workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
     workletNode.port.onmessage = (e) => { if (capturing) capturedChunks.push(e.data); };
     source.connect(workletNode);
-    dlog("Mic graph connected -- unlock complete");
-    unlockBtn.hidden = true;
-    talkBtn.hidden = false;
+    dlog("Mic graph connected -- armed");
+    talkBtn.dataset.state = "idle";
+    talkBtn.textContent = "HOLD TO TALK";
+    return true;
   } catch (err) {
-    dlog(`Unlock failed: ${err}`, true);
-    unlockBtn.classList.add("failed");
-    unlockBtn.textContent = "Tap to try again";
+    dlog(`Arming failed: ${err}`, true);
+    talkBtn.dataset.state = "disarmed";
+    talkBtn.textContent = "TAP TO ARM";
+    return false;
   }
 }
-unlockBtn.addEventListener("click", unlockAudio);
+// Arm without asking, and only fall back to asking if iOS refuses.
+// Installed to the Home Screen, iOS keeps the microphone grant across
+// relaunches (confirmed on Sir's iPhone 2026-09-18), so on almost every
+// launch there is nothing to ask for and the old separate 'tap to enable
+// microphone' button was pure friction. When iOS does refuse -- Web Audio
+// needs a user gesture and iOS counts only the RELEASE, never
+// pointerdown, which is why a hold-to-talk PRESS can never itself be the
+// unlocking gesture -- the button says TAP TO ARM and one tap does it.
+talkBtn.addEventListener("click", () => {
+  if (talkBtn.dataset.state !== "disarmed") return;
+  unlockAudio();
+});
+// Bounded, because arming can HANG rather than fail: commit 99b77c7
+// recorded AudioContext.resume() never settling when iOS withholds the
+// gesture, and a promise that never rejects would leave the button
+// sitting on ARMING with nothing telling Sir to tap it. The timeout only
+// rewrites the label; a later success overwrites it, and if arming never
+// completes, one tap still arms.
+(async () => {
+  const late = setTimeout(() => {
+    if (talkBtn.dataset.state === "disarmed") talkBtn.textContent = "TAP TO ARM";
+  }, 2500);
+  await unlockAudio();
+  clearTimeout(late);
+})();
 
 async function startCapture() {
   dlog("startCapture: pointerdown fired");
+  stopPlayback();
   capturedChunks = [];
   capturing = true;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -844,7 +1025,7 @@ async function startCapture() {
   ws.send(JSON.stringify({ type: "utterance_start", rate: audioCtx.sampleRate }));
   dlog(`Sent utterance_start (rate=${audioCtx.sampleRate})`);
   talkBtn.dataset.state = "listening";
-  talkBtn.textContent = "Listening...";
+  talkBtn.textContent = "LISTENING";
 }
 
 function stopCapture() {
@@ -867,13 +1048,14 @@ function stopCapture() {
   ws.send(int16.buffer);
   ws.send(JSON.stringify({ type: "utterance_end" }));
   dlog(`Sent utterance: ${total} samples`);
-  talkBtn.textContent = "Sending...";
+  talkBtn.textContent = "SENDING";
 }
 
 talkBtn.addEventListener("pointerdown", (e) => {
   e.preventDefault();
   dlog(`pointerdown (button state=${talkBtn.dataset.state})`);
-  if (talkBtn.dataset.state === "busy") return;
+  const st = talkBtn.dataset.state;
+  if (st === "busy" || st === "disarmed") return;
   startCapture().catch((err) => dlog(`startCapture failed: ${err}`, true));
 });
 talkBtn.addEventListener("pointerup", (e) => { dlog("pointerup"); e.preventDefault(); stopCapture(); });
@@ -888,6 +1070,107 @@ talkBtn.addEventListener("contextmenu", (e) => e.preventDefault());
 // completely inert. Removed. The CSS fix (-webkit-user-select:none)
 // is what actually addresses the text-selection issue; this was an
 // unnecessary and harmful addition on top of it.
+
+// ---- plan-usage readout --------------------------------------------
+// A port of ai-visualizer/core.js's widget, deliberately not a second
+// implementation: two copies of the same rules drift, and the whole
+// point is that the phone and the desktop face agree.
+//
+// COLOUR IS DRIVEN BY THE 5-HOUR WINDOW ONLY (Sir's call, 2026-09-16):
+// context auto-compacts at 97% so it looks after itself, and the weekly
+// window is not one he realistically reaches. Both are still displayed,
+// they just never drive the colour. It returns to white on its own as
+// the percentage drops at reset, so no reset handling is needed.
+const RL_OK = "#ffffff", RL_WARN = "#ffb84d", RL_HIT = "#ff4d4d";
+const RL_WARN_PCT = 80, RL_HIT_PCT = 95;
+// Nothing writes the source file unless a Claude Code session is live,
+// so a reading can age. Showing an old percentage as if it were current
+// would be a lie: dim it and say so.
+const RL_STALE_S = 300;
+// NOTE: display is set to an explicit "block", never "". In
+// ai-visualizer the hidden state is an INLINE style, so clearing it
+// reveals the element; here it lives in the stylesheet, and clearing
+// the inline value just falls back to display:none. Same line, opposite
+// result -- caught by screenshotting the port rather than trusting it.
+const usageEl = document.getElementById("usage");
+let rlKey = null, rlTimer = null;
+
+function rlAgo(sec) {
+  if (sec < 90) return `${Math.round(sec)}s`;
+  const m = Math.round(sec / 60);
+  return m < 90 ? `${m}m` : `${Math.round(m / 60)}h`;
+}
+function rlUntil(epoch) {
+  const s = epoch - Date.now() / 1000;
+  if (s <= 0) return "due";
+  const m = Math.round(s / 60), h = Math.floor(m / 60);
+  return h ? `${h}h${String(m % 60).padStart(2, "0")}m` : `${m}m`;
+}
+
+async function usagePoll() {
+  let d;
+  try {
+    const r = await fetch("/rate_limit", { cache: "no-store" });
+    if (r.status === 404) {
+      // No usage file configured on this install. Stop asking: polling a
+      // dead endpoint every three seconds forever is pure waste, and a
+      // permanent "usage n/a" would be noise rather than information.
+      clearInterval(rlTimer);
+      usageEl.style.display = "none";
+      dlog("usage readout off (server has no usage_file configured)");
+      return;
+    }
+    d = await r.json();
+  } catch (e) { return; }   // server gone: leave the last reading on screen
+
+  if (!d || d.present === false || d.present === undefined) {
+    if (rlKey !== "none") {
+      rlKey = "none";
+      usageEl.style.color = RL_OK;
+      usageEl.style.opacity = "0.45";
+      usageEl.textContent = "usage n/a";
+      usageEl.style.display = "block";
+    }
+    return;
+  }
+
+  const five = d.five_hour || {}, seven = d.seven_day || {};
+  const age = d.captured_at_epoch
+    ? Date.now() / 1000 - d.captured_at_epoch : null;
+  const stale = age !== null && age > RL_STALE_S;
+
+  const parts = [];
+  if (d.model) parts.push(d.model);
+  if (d.context_pct != null) parts.push(`ctx ${Math.round(d.context_pct)}%`);
+  if (five.used_percentage != null) {
+    let s = `5h ${Math.round(five.used_percentage)}%`;
+    if (five.resets_at) s += ` (${rlUntil(five.resets_at)})`;
+    parts.push(s);
+  }
+  if (seven.used_percentage != null) {
+    let s = `7d ${Math.round(seven.used_percentage)}%`;
+    if (seven.resets_at) s += ` (${rlUntil(seven.resets_at)})`;
+    parts.push(s);
+  }
+  let text = parts.join(" | ");
+  if (stale) text += `  (stale ${rlAgo(age)})`;
+
+  const p = five.used_percentage;
+  const colour = p == null ? RL_OK
+    : p >= RL_HIT_PCT ? RL_HIT
+    : p >= RL_WARN_PCT ? RL_WARN : RL_OK;
+
+  const key = text + "|" + colour;
+  if (key === rlKey) return;      // repaint only on a real change
+  rlKey = key;
+  usageEl.style.color = colour;
+  usageEl.style.opacity = stale ? "0.5" : "1";
+  usageEl.textContent = text;
+  usageEl.style.display = "block";
+}
+
+usagePoll();
+rlTimer = setInterval(usagePoll, 3000);
 
 connect();
 </script>
