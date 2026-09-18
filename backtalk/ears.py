@@ -337,8 +337,6 @@ def warm():
                 want = CFG["stt_device"]
                 log(f"[ears] loading {CFG['stt_model']} "
                     f"({want}/{CFG['stt_compute']})...")
-                _model = WhisperModel(CFG["stt_model"], device=want,
-                                      compute_type=CFG["stt_compute"])
                 # PROVE the device before the greeting, not at the first
                 # spoken sentence. WhisperModel CONSTRUCTS perfectly well
                 # against a GPU it cannot actually use: "auto" picks CUDA
@@ -350,9 +348,20 @@ def warm():
                 # connect to a setting. The Apple-GPU branch above has
                 # always done this; this one never did.
                 try:
+                    # CONSTRUCTION IS INSIDE THE GUARD, not just the probe.
+                    # A CUDA OOM here (Voicebox holding the card, 2026-09-15)
+                    # raised straight out of warm() and killed its caller with
+                    # no log line at all: the log showed "[ears] loading ..."
+                    # and simply stopped. The CPU fallback below was already
+                    # right there; the failure just never reached it.
+                    _model = WhisperModel(CFG["stt_model"], device=want,
+                                          compute_type=CFG["stt_compute"])
                     _probe(_model)
                 except Exception as e:
                     if want == "cpu":
+                        log(f"[ears] the CPU backend itself failed to load "
+                            f"({type(e).__name__}: {e}). Speech recognition "
+                            f"is unavailable.")
                         raise
                     log(f"[ears] {want!r} does not work on this machine "
                         f"({type(e).__name__}: {e}).")
@@ -364,9 +373,15 @@ def warm():
                     # CPU outright. int8 is CPU's own efficient default
                     # (see config.py), so the fallback actually degrades
                     # instead of crashing on top of the GPU failure.
-                    _model = WhisperModel(CFG["stt_model"], device="cpu",
-                                          compute_type="int8")
-                    _probe(_model)
+                    try:
+                        _model = WhisperModel(CFG["stt_model"], device="cpu",
+                                              compute_type="int8")
+                        _probe(_model)
+                    except Exception as e2:
+                        log(f"[ears] the CPU fallback also failed "
+                            f"({type(e2).__name__}: {e2}). Speech recognition "
+                            f"is unavailable; the voice line cannot hear.")
+                        raise
                 _backend = "faster-whisper"
             log(f"[ears] model ready ({_backend})")
     return _model
