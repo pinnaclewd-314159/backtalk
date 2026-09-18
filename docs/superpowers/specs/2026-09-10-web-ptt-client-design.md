@@ -84,3 +84,23 @@ Mirrors `satellites.py`'s existing philosophy directly, extended to the new conn
 ## Future extension (explicitly out of scope now)
 
 Room/device identity, the same deferred item the original Wyoming listener spec carries — useful once there's a reason to give the agent per-device context (e.g. "the Kitchen tablet" implying the Kitchen's lights), not needed for this spec's actual ask.
+
+---
+
+## Revision 2026-09-18 — TLS moved to Tailscale, self-signed generation removed
+
+**Supersedes the self-signed certificate approach this spec shipped with.** The original design generated a self-signed cert covering every local IPv4 address and regenerated it whenever one of those addresses was missing from the existing cert's SAN list. On a machine with a Hyper-V/WSL virtual adapter, that address changes across reboots, so the cert was regenerated on nearly every boot — with a new private key each time, silently voiding the trust exception every device had granted. Eight regenerations were logged between 2026-09-12 and 2026-09-17. This is the most likely reason no browser utterance was ever confirmed working.
+
+**What changed in `web_client.py`:**
+
+- Deleted `_local_ip_addresses()`, `_generate_self_signed_cert()` and `ensure_self_signed_cert()`, along with the `cryptography`, `ipaddress`, `socket` and `datetime` imports they alone used.
+- Added `load_tls(cert_dir)` and `_CertWatcher`. The cert and key are now read from disk, produced by `tailscale cert` and signed by Let's Encrypt for the machine's MagicDNS name. `_CertWatcher` re-checks the files hourly and calls `load_cert_chain()` on the live context, so a renewal applies to new connections without restarting the voice line.
+- `start_server` catches a missing cert, logs it, and returns `None` instead of raising. The PTT server alone declines to start; the local voice line, the satellite listener and the face are unaffected. **There is deliberately no fallback to a self-signed cert** — that fallback is precisely what produced the trust churn, and it would hide the fault until a device failed weeks later.
+- `start_server`'s signature is unchanged, so `main.py` needed no edit.
+
+**Operational consequences, documented in the vault at `Browser Push-to-Talk`:**
+
+- The page's address is now the MagicDNS name (`https://<machine>.<tailnet>.ts.net:8795/`), not a bare LAN IP. A certificate is bound to a name rather than an address, so the same cert also serves LAN devices that are not on the tailnet, via a local DNS record pointing that same name at the LAN IP.
+- Certificates obtained with `tailscale cert` do **not** auto-renew; tailscaled only auto-renews when it owns the install path. Renewal is a weekly scheduled task running `tools/renew_tailscale_cert.ps1` (outside this repo, as it is machine-specific).
+
+**Unchanged by this revision:** the wire protocol, the turn-lock sharing with `satellites.py`, the frontend capture path, and every touch-UI requirement in this spec. Only how the connection is secured changed.

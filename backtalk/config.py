@@ -279,6 +279,14 @@ DEFAULTS = {
     # protocol on one port via websockets' process_request hook. See
     # docs/superpowers/specs/2026-09-10-web-ptt-client-design.md.
     "web_ptt_port": 8795,
+    # Absolute path to a Claude Code plan-usage snapshot, as written by
+    # a status-line hook. When set, the PTT page shows a live usage
+    # readout (model, context %, 5-hour and weekly windows) in the same
+    # form the desktop face shows. Empty means the feature is off and
+    # /rate_limit 404s, which is the right default: this file is
+    # specific to one machine's setup, and a permanent "usage n/a" on
+    # everyone else's phone would be noise rather than information.
+    "usage_file": "",
     # THE BAREHANDS SEAM: point this at a barehands checkout's state/
     # folder and its on-screen ring becomes your agent's face — it
     # breathes while idle, spins while thinking, pulses with the voice.

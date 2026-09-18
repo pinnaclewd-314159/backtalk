@@ -19,12 +19,10 @@
 listener alongside satellites.py's Wyoming one, sharing the same
 TurnLock/SatelliteRegistry pattern. See docs/superpowers/specs/
 2026-09-10-web-ptt-client-design.md."""
-import datetime
+import asyncio
 import inspect
-import ipaddress
 import json
 import mimetypes
-import socket
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,13 +30,10 @@ from pathlib import Path
 import numpy as np
 import websockets
 import websockets.asyncio.server
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
+from backtalk.config import CFG
 from backtalk.satellites import resample_pcm
 from backtalk.vlog import log
 
@@ -114,91 +109,72 @@ async def push_state(conn: WebConnection, state: str) -> None:
         log(f"[web_client] {conn.name} push_state failed: {e}")
 
 
-def _local_ip_addresses() -> list[str]:
-    """Best-effort list of this machine's own LAN IPv4 addresses, for the
-    cert's Subject Alternative Names -- a phone reaches this box by IP,
-    not hostname, and modern browsers reject a cert that doesn't carry
-    the IP in its SAN list (a CN-only cert no longer satisfies them)."""
-    ips = {"127.0.0.1"}
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
-    try:
-        # A UDP "connect" never sends a packet -- it just makes the OS
-        # pick which local interface WOULD be used, which is the real
-        # LAN-facing IP even on a multi-homed box.
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            ips.add(s.getsockname()[0])
-    except OSError:
-        pass
-    return sorted(ips)
+class CertMissing(Exception):
+    """No cert/key pair on disk for the PTT server to serve."""
 
 
-def _generate_self_signed_cert(cert_path: Path, key_path: Path) -> None:
-    """Writes a self-signed cert/key good for 10 years, SANs covering
-    localhost plus every LAN IP found on this machine right now. A
-    device on the LAN sees one browser warning ("this connection is not
-    private") on first visit -- expected under the LAN-only trust model
-    this whole server already runs under (no auth, matching
-    satellites.py); a real project (github.com/bashalarmistalt/
-    decimen-optical-transfer) documents this exact pattern -- accept the
-    self-signed cert once per device -- for the identical getUserMedia-
-    needs-a-secure-context problem."""
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, "backtalk-ptt.local"),
-    ])
-    san_entries = [x509.DNSName("localhost")]
-    for ip in _local_ip_addresses():
-        san_entries.append(x509.IPAddress(ipaddress.ip_address(ip)))
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=3650))
-        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
-        .sign(key, hashes.SHA256())
-    )
-    cert_path.parent.mkdir(parents=True, exist_ok=True)
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ))
+class _CertWatcher:
+    """Holds the TLS context, and reloads it when the cert changes on disk.
+
+    backtalk does NOT mint certificates any more. It used to generate a
+    self-signed one covering every local IPv4 address, and regenerate it
+    -- new private key included -- whenever any of those addresses was
+    missing from the old cert. A Hyper-V/WSL virtual adapter changes its
+    address across reboots, so this fired on nearly every boot, and each
+    regeneration silently voided the trust exception every phone had
+    granted. A device that worked last night was untrusted this morning,
+    which is why the browser PTT client never once got confirmed working.
+
+    The cert now comes from `tailscale cert`: signed by Let's Encrypt,
+    valid for the machine's MagicDNS name, and trusted by every device
+    with nothing installed on any of them. Renewal is
+    tools/renew_tailscale_cert.ps1.
+    """
+
+    RELOAD_EVERY_SEC = 3600
+
+    def __init__(self, cert_path: Path, key_path: Path):
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._stamp = None
+        self._task = None
+        self._load()
+
+    def _read_stamp(self):
+        return (self.cert_path.stat().st_mtime, self.key_path.stat().st_mtime)
+
+    def _load(self):
+        self.context.load_cert_chain(str(self.cert_path), str(self.key_path))
+        self._stamp = self._read_stamp()
+
+    async def watch(self):
+        """A renewal lands as a new file on disk. load_cert_chain() on the
+        LIVE context applies it to every connection opened after this
+        point, so the 90-day renewal never costs Sir a restart in the
+        middle of a conversation. Every failure is caught and logged: the
+        old cert stays loaded and working, and a broken reload must never
+        take the voice line down."""
+        while True:
+            await asyncio.sleep(self.RELOAD_EVERY_SEC)
+            try:
+                if self._read_stamp() != self._stamp:
+                    self._load()
+                    log("[web_client] TLS cert changed on disk -- reloaded")
+            except Exception as e:
+                log(f"[web_client] TLS reload failed, keeping the loaded cert: {e!r}")
 
 
-def ensure_self_signed_cert(cert_dir: Path) -> ssl.SSLContext:
-    """Returns an SSLContext for start_server(), generating a cert/key
-    once and reusing it on every later launch. Regenerated automatically
-    if this machine's LAN IP has changed since the cert was made (the
-    old one just wouldn't validate for the new IP) -- delete cert_dir to
-    force a fresh one for any other reason."""
+def load_tls(cert_dir: Path) -> _CertWatcher:
+    """Load cert.pem/key.pem from cert_dir. Raises CertMissing if either
+    is absent -- deliberately NOT falling back to a self-signed pair,
+    because that fallback is what produced the trust churn above and it
+    would hide the real problem until a phone failed weeks later."""
     cert_path = cert_dir / "cert.pem"
     key_path = cert_dir / "key.pem"
-    if cert_path.exists() and key_path.exists():
-        existing = x509.load_pem_x509_certificate(cert_path.read_bytes())
-        san = existing.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName).value
-        covered = {str(ip) for ip in san.get_values_for_type(x509.IPAddress)}
-        if not set(_local_ip_addresses()) <= covered:
-            log("[web_client] this machine's LAN IP changed since the cert "
-                "was generated -- making a new one")
-            _generate_self_signed_cert(cert_path, key_path)
-    else:
-        log(f"[web_client] generating a self-signed TLS cert at {cert_dir} "
-            f"(one-time; each device sees a browser warning to accept once)")
-        _generate_self_signed_cert(cert_path, key_path)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(str(cert_path), str(key_path))
-    return ctx
+    if not (cert_path.is_file() and key_path.is_file()):
+        raise CertMissing(f"no cert.pem/key.pem in {cert_dir}")
+    return _CertWatcher(cert_path, key_path)
 
 
 # Path-traversal-safe static file responder for process_request's plain-
@@ -224,11 +200,64 @@ def _static_response(static_dir: Path, path: str) -> Response:
     return Response(200, "OK", headers, body)
 
 
+def _usage_payload():
+    """Plan usage for the page's readout, in the same shape ai-visualizer's
+    server.py serves at its own /rate_limit -- deliberately identical, so
+    the widget is a port of that one rather than a second implementation
+    that can drift away from it.
+
+    Returns None when the feature is switched off or the file cannot be
+    read, which the caller turns into a 404 so the widget hides itself
+    for good instead of polling a dead endpoint every three seconds.
+
+    `captured_at_epoch` is passed through on purpose: nothing writes that
+    file unless a Claude Code session is live, so a reading can age, and
+    showing a stale percentage as if it were current would be a lie. The
+    browser decides what counts as stale; it is not filtered out here."""
+    raw = (CFG.get("usage_file") or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(Path(raw).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not payload.get("rate_limits_present"):
+        # Genuinely absent (before the first response, or a plan without
+        # published limits). A real state, not an error.
+        return {"present": False,
+                "captured_at_epoch": payload.get("captured_at_epoch")}
+    rl = payload.get("rate_limits") or {}
+    ctx = payload.get("context_window") or {}
+    return {
+        "present": True,
+        "captured_at_epoch": payload.get("captured_at_epoch"),
+        "model": payload.get("model"),
+        "context_pct": ctx.get("used_percentage"),
+        "five_hour": rl.get("five_hour"),
+        "seven_day": rl.get("seven_day"),
+    }
+
+
+def _json_response(obj) -> Response:
+    body = json.dumps(obj).encode("utf-8")
+    headers = Headers()
+    headers["Content-Type"] = "application/json"
+    headers["Content-Length"] = str(len(body))
+    headers["Cache-Control"] = "no-store"
+    return Response(200, "OK", headers, body)
+
+
 def _make_process_request(static_dir: Path):
     async def process_request(connection, request):
         if "Upgrade" in request.headers and request.headers["Upgrade"].lower() == "websocket":
             return None       # let the WS handshake proceed
-        return _static_response(static_dir, request.path.split("?", 1)[0])
+        path = request.path.split("?", 1)[0]
+        if path == "/rate_limit":
+            usage = _usage_payload()
+            if usage is None:
+                return Response(404, "Not Found", Headers(), b"")
+            return _json_response(usage)
+        return _static_response(static_dir, path)
     return process_request
 
 
@@ -290,10 +319,25 @@ async def start_server(host: str, port: int, on_utterance, registry,
     async def handler(ws):
         await _handle_connection(ws, on_utterance, registry, on_disconnect)
 
-    ssl_context = ensure_self_signed_cert(Path(cert_dir))
+    try:
+        watcher = load_tls(Path(cert_dir))
+    except (CertMissing, OSError, ssl.SSLError) as e:
+        # Loud, and only fatal to THIS server. The mic cannot work over
+        # plain HTTP in any browser, so there is no degraded mode worth
+        # starting -- but the local voice line, the satellites and the
+        # face have nothing to do with this and must stay up.
+        log(f"[web_client] NOT STARTING the PTT web server: {e}")
+        log("[web_client] fix: tools/renew_tailscale_cert.ps1 (or run "
+            "`tailscale cert` by hand), then restart the voice line")
+        return None
+
     server = await websockets.asyncio.server.serve(
-        handler, host, port, ssl=ssl_context, max_size=MAX_MESSAGE_BYTES,
+        handler, host, port, ssl=watcher.context, max_size=MAX_MESSAGE_BYTES,
         process_request=_make_process_request(Path(static_dir)))
+    # Held on the watcher, not dropped: a bare create_task() reference can
+    # be garbage-collected mid-flight, and its exception would vanish into
+    # stderr rather than backtalk.log.
+    watcher._task = asyncio.create_task(watcher.watch())
     log(f"[web_client] PTT web server on https://{host}:{port}")
     return server
 
@@ -301,7 +345,6 @@ async def start_server(host: str, port: int, on_utterance, registry,
 if __name__ == "__main__":
     # Quick self-test / smoke check, not a full test suite -- same
     # convention as satellites.py's own __main__ block.
-    import asyncio
 
     def _run():
         # A fake connection recording every .send() call, so send_reply's
