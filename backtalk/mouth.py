@@ -77,10 +77,15 @@ def _strip_markdown(text: str) -> str:
     mispronouncing them. Strip the offenders here so a lapse upstream
     never reaches the speaker. Applied once in synth_stream(), ahead
     of every engine. Underscore becomes a space, not nothing — an
-    identifier like `stt_model` must not glue into "sttmodel"."""
+    identifier like `stt_model` must not glue into "sttmodel". Em/en
+    dashes and path separators (backslash, pipe) get the same backstop
+    treatment after a 2026-09-17 incident where an em dash and a raw
+    Windows path slipped into a spoken reply."""
     text = _MD_HEADER_RE.sub("", text)
     text = _MD_BULLET_RE.sub("", text)
     text = text.replace("_", " ")
+    text = text.replace("—", ", ").replace("–", ", ")
+    text = text.replace("\\", " ").replace("|", " ")
     return text.replace("*", "").replace("`", "").replace("#", "")
 
 
@@ -518,7 +523,8 @@ class Mouth:
                 log("[mouth] the output stream went away, reopening")
         self._drop_out()
         try:
-            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16",
+                                        device=self._speaker_index())
             self._out.start()
         except Exception as e:
             # Mirrors ears._reopen_after_device_change: PortAudio caches
@@ -529,10 +535,60 @@ class Mouth:
             log(f"[mouth] output device open failed ({e}) -- "
                 f"rebuilding the audio system")
             self._rebuild_audio()
-            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16",
+                                        device=self._speaker_index())
             self._out.start()
         self._out_rate = rate
         return self._out
+
+    @staticmethod
+    def _speaker_index():
+        """Resolve speaker_device (a device NAME) to an index, or None for default.
+
+        The output twin of ears._mic_index, and it exists for the reason that
+        function's own docstring already records: plugging a USB device in
+        "moved the default pair from [-1, 1] to [1, 3], silently changing the
+        OUTPUT device too". The mic was hardened against that; the speaker was
+        left following whatever Windows currently calls default.
+
+        Measured 2026-09-17: the machine's usual output (a Creative Bluetooth
+        Audio W2 USB dongle) went absent, Windows silently moved the default,
+        and the voice line went mute with NO error -- writes succeeded into a
+        device nobody was listening to. Set speaker_device and the voice line
+        stops caring what the system default does.
+
+        A NAME, never an index, and re-resolved on every open, because indices
+        shift on exactly the events this setting exists to survive. Exact name
+        wins, then the first case-insensitive substring.
+        """
+        raw = CFG.get("speaker_device", "") or ""
+        wants = [raw] if isinstance(raw, str) else list(raw)
+        wants = [str(w).strip() for w in wants if str(w).strip()]
+        if not wants:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            log(f"[mouth] could not list audio devices ({e}) -- using the default speaker")
+            return None
+        outs = [(i, d) for i, d in enumerate(devices)
+                if d.get("max_output_channels", 0) > 0]
+        # Ordered preference: the first name that is actually present wins, so a
+        # USB output dropping off the bus falls through to the next choice
+        # instead of going mute. On this machine that means the USB monitor
+        # first and the HDMI output second, the latter being immune to USB
+        # enumeration churn entirely.
+        for want in wants:
+            for i, d in outs:
+                if d["name"] == want:
+                    return i
+            low = want.lower()
+            for i, d in outs:
+                if low in d["name"].lower():
+                    return i
+        log(f"[mouth] none of speaker_device {wants!r} are present -- using the "
+            f"system default. Outputs I can see: {[d['name'] for _, d in outs]}")
+        return None
 
     @staticmethod
     def _rebuild_audio():

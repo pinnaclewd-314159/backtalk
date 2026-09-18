@@ -86,6 +86,14 @@ DEFAULTS = {
     # Extra folders the agent may access beyond agent_dir (e.g. your
     # notes vault). Absolute paths or ~ paths.
     "extra_dirs": [],
+    # Output device NAME (not an index) for the spoken voice. "" follows
+    # the system default, which is a moving target: Windows silently
+    # reassigns it whenever an audio device appears or disappears, and the
+    # voice line then goes mute with NO error, writing happily into a
+    # device nobody is listening to. Set this on any machine where the
+    # voice must keep working. Matched exact-first, then case-insensitive
+    # substring, and re-resolved on every open. See Mouth._speaker_index.
+    "speaker_device": "",
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
