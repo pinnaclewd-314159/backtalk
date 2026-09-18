@@ -517,10 +517,45 @@ class Mouth:
             except Exception:
                 log("[mouth] the output stream went away, reopening")
         self._drop_out()
-        self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        try:
+            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+            self._out.start()
+        except Exception as e:
+            # Mirrors ears._reopen_after_device_change: PortAudio caches
+            # the device list at init, so a device that blips leaves a
+            # stale entry behind and every reopen fails identically
+            # forever. Rebuilding refreshes the list; this is the output
+            # side of the same fix, previously mic-only.
+            log(f"[mouth] output device open failed ({e}) -- "
+                f"rebuilding the audio system")
+            self._rebuild_audio()
+            self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+            self._out.start()
         self._out_rate = rate
-        self._out.start()
         return self._out
+
+    @staticmethod
+    def _rebuild_audio():
+        """Force PortAudio to re-scan the devices.
+
+        Its device list is built once at init and never refreshed, so ANY
+        change to the machine's audio devices -- an interface unplugged, the
+        mixer restarted, a Bluetooth radio toggled -- leaves the list stale
+        and every subsequent open OR write fails identically, forever, until
+        the library is reinitialised. Restarting the process is not required
+        and must not be the recovery path for something this routine.
+
+        Measured 2026-09-17: repeated Bluetooth toggling during PTT hardware
+        testing put the voice line into exactly this state, and it then failed
+        every single sentence with MME error 6, 'There is no driver installed
+        on your system', while the devices were provably fine when probed from
+        a fresh process.
+        """
+        try:
+            sd._terminate()
+        except Exception:
+            pass
+        sd._initialize()
 
     def _cut(self):
         """Barge-in cut: stop feeding audio and pad the line with a beat
@@ -575,16 +610,34 @@ class Mouth:
                 _sig.direction(directions)
 
             def _write(pcm):
+                nonlocal out
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
-                    out.write(pcm[i:i + block])
+                    chunk = pcm[i:i + block]
+                    try:
+                        out.write(chunk)
+                    except Exception as e:
+                        # The SAME stale-device-list failure _get_out guards
+                        # against, but on the write side, which is where it
+                        # actually lands once a stream is already open. Without
+                        # this, every sentence fails forever and only killing
+                        # the process recovers it -- the exact symptom on
+                        # 2026-09-17. Rebuild the audio system and retry this
+                        # block once; a second failure gives up on the sentence
+                        # rather than wedging the speech thread.
+                        log(f"[mouth] output write failed ({e}) -- "
+                            f"rebuilding the audio system and retrying")
+                        self._drop_out()
+                        self._rebuild_audio()
+                        out = self._get_out(rate)
+                        out.write(chunk)
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
                     if self._stop.is_set():
                         return False
-                    signals.feed_waveform(pcm[i:i + block])
+                    signals.feed_waveform(chunk)
                 return True
             for pcm in head:
                 if not _write(pcm):
