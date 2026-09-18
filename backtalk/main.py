@@ -1464,7 +1464,8 @@ async def amain():
         # reproduces today's behavior exactly -- mic_state never
         # leaves "wake" and every call behaves like the old bare
         # listen_once(gate=mic_gate, abort=...).
-        ptt = PTTListener(CFG["ptt_key"])
+        ptt = PTTListener(CFG["ptt_key"], CFG.get("ptt_extra_keys", []),
+                          max_hold=CFG.get("ptt_max_hold_s", 120))
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]

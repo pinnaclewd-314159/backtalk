@@ -89,6 +89,16 @@ DEFAULTS = {
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
+    # Extra hold-to-talk keys that act exactly like ptt_key, e.g. ["f13"]
+    # for a Bluetooth push-to-talk button. ptt_key stays the one named in
+    # greetings and status lines.
+    "ptt_extra_keys": [],
+    # Seconds after which a hold is treated as a STUCK KEY and released.
+    # A wireless button can die mid-hold with no key-up ever arriving (seen
+    # 2026-09-17: Bluetooth switched off while held, no release for 90s),
+    # which would otherwise leave the mic open indefinitely. Generous
+    # enough never to cut off a real person mid-sentence.
+    "ptt_max_hold_s": 120,
     # The microphone mode. "ptt" (push to talk, the default and the
     # recommendation): the mic is closed except while the key is held,
     # so room audio and your own speakers can never trigger the agent.

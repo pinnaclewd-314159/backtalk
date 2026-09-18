@@ -81,10 +81,29 @@ class PTTListener:
     # is ~30ms) and short enough that letting go still feels instant.
     RELEASE_GRACE = 0.12
 
-    def __init__(self, key="home"):
-        self._key = resolve_key(key) if isinstance(key, str) else key
+    # AND THE TRAP ON THE OTHER SIDE: a release is not guaranteed to ARRIVE.
+    # A wireless button can vanish mid-hold, and nothing ever sends the
+    # key-up. Measured 2026-09-17 with the Bluetooth PTT button: turning the
+    # PC's Bluetooth off while the button was held killed the link before the
+    # board could send its key-up, and Windows did NOT synthesise one -- the
+    # probe saw raw_up=0 for the remaining 90 seconds. Without this cap the
+    # mic would stay open forever, silently recording.
+    #
+    # The device cannot fix this; it has no link left to send a release over.
+    # Generous enough that a real person is never cut off mid-sentence.
+    MAX_HOLD = 120.0
+
+    def __init__(self, key="home", extra_keys=(), max_hold=None):
+        # The primary key plus any extras (e.g. a Bluetooth PTT button
+        # sending F13). A press or release of ANY of them drives the same
+        # held state; the repeat filter and release grace apply unchanged.
+        self._keys = tuple(resolve_key(k) if isinstance(k, str) else k
+                           for k in (key, *extra_keys))
+        self._key = self._keys[0]
         self._held = False
         self._release_t = None          # a release awaiting confirmation
+        self._press_t = None            # when the CURRENT hold began
+        self._max_hold = self.MAX_HOLD if max_hold is None else max_hold
         self._press_evt = threading.Event()
         self._listener = keyboard.Listener(on_press=self._on_press,
                                            on_release=self._on_release)
@@ -92,17 +111,20 @@ class PTTListener:
         self._listener.start()
 
     def _on_press(self, k):
-        if k != self._key:
+        if k not in self._keys:
             return
         # A press cancels any pending release: that release was auto-repeat,
         # not a human letting go.
         self._release_t = None
         if not self._held:                      # filter key-repeat
             self._held = True
+            # Stamped ONLY on the real press, never on a repeat, or a stuck
+            # key's own auto-repeat would push the deadline out forever.
+            self._press_t = time.monotonic()
             self._press_evt.set()
 
     def _on_release(self, k):
-        if k == self._key:
+        if k in self._keys:
             # PROVISIONAL. Believed only if no press follows; see _settle().
             self._release_t = time.monotonic()
 
@@ -113,6 +135,18 @@ class PTTListener:
                 time.monotonic() - r >= self.RELEASE_GRACE:
             self._held = False
             self._release_t = None
+            self._press_t = None
+            return
+        # No release arrived at all. See MAX_HOLD: the key is stuck, not held.
+        p = self._press_t
+        if self._held and p is not None and \
+                time.monotonic() - p >= self._max_hold:
+            print(f"[ptt] hold exceeded {self._max_hold:g}s — treating as a "
+                  f"stuck key and releasing (wireless button out of range?)",
+                  flush=True)
+            self._held = False
+            self._release_t = None
+            self._press_t = None
 
     def wait_press(self):
         """Block until the key goes DOWN (one event per physical press)."""
