@@ -31,7 +31,12 @@ while ((Get-Date) -lt $deadline) {
     }
 }
 
-Start-Process cmd.exe -ArgumentList '/c "uv run python -m backtalk.main"' -WorkingDirectory $WorkDir
+# Stderr goes to logs/voice_line_stderr.log so a silent death leaves
+# receipts: unhandled exceptions from an orphaned asyncio.create_task
+# never reach backtalk.log, they go to stderr and vanish with the window.
+# The banner uses [square brackets], NOT parentheses - a ')' inside a
+# cmd (echo ...) block closes the block early and the whole line is lost.
+Start-Process cmd.exe -ArgumentList '/c "(echo [%date% %time%] ---- voice line start [restart helper] ----)>>logs\voice_line_stderr.log & uv run python -m backtalk.main 2>>logs\voice_line_stderr.log"' -WorkingDirectory $WorkDir
 
 try {
     Unregister-ScheduledTask -TaskName 'Jarvis - Backtalk Restart Helper' -Confirm:$false -ErrorAction Stop
