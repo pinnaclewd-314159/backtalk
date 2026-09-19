@@ -97,20 +97,56 @@ class TurnLock:
             self._owner = None
 
 
+# Windowed-sinc low-pass, numpy only -- see resample_pcm for why this
+# exists. 63 taps with a Blackman window puts the stopband below -60dB,
+# which is the figure that matters: linear interpolation on its own only
+# attenuates by 3-5dB, and anything it leaves above the target Nyquist
+# comes back as an in-band alias at very nearly full amplitude.
+_LOWPASS_TAPS = 63
+
+
+def _lowpass_taps(cutoff_hz: float, rate: int, n_taps: int = _LOWPASS_TAPS) -> np.ndarray:
+    fc = cutoff_hz / rate                      # cycles per sample
+    m = np.arange(n_taps) - (n_taps - 1) / 2.0
+    h = 2 * fc * np.sinc(2 * fc * m) * np.blackman(n_taps)
+    return h / h.sum()                         # unity gain at DC
+
+
 def resample_pcm(pcm: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
-    """int16 mono PCM at from_rate -> int16 mono PCM at to_rate, via plain
-    linear interpolation. No scipy/librosa in this project (ears.py and
-    mouth.py don't use one either) -- this is voice-quality resampling,
-    not hi-fi, and linear interpolation is more than sufficient for
-    speech intelligibility over a small speaker.
+    """int16 mono PCM at from_rate -> int16 mono PCM at to_rate, via a
+    low-pass filter (downsampling only) followed by linear interpolation.
+    No scipy/librosa in this project (ears.py and mouth.py don't use one
+    either, and scipy is only a transitive dependency here -- `uv sync`
+    strips anything pyproject.toml doesn't declare).
+
+    HARD-WON AUDIO LAW #3 (2026-09-18) -- DOWNSAMPLING WITHOUT THE
+    LOW-PASS FIRST IS BROKEN, however good the interpolator is. Dropping
+    24kHz Kokoro to the satellites' 16kHz wire rate folds everything
+    above 8kHz straight back into the speech band. Measured on this
+    function before the filter existed: a 10kHz tone, which must vanish
+    entirely, survived at -4.0dB aliased down to 6kHz; correct filtering
+    puts it at -57dB. Sibilants are where a TTS voice keeps most of its
+    8-12kHz energy, so the damage lands on consonants and reads as a
+    fuzzy, distorted voice. ElevenLabs at 44.1kHz was far worse again.
+
+    This went unheard for months because the ESP32-S3-BOX-3's onboard
+    speaker barely reproduces 4-8kHz and was masking it. It was an
+    external PCM5102A DAC into a powered speaker that finally exposed it.
+    Diagnosis is in JarvisVault 07 - Resources/BOX-3 Hardware Facts.md.
+
+    Cutoff sits at 45% of the target rate, leaving the filter's
+    transition band room to land before the new Nyquist.
     """
     if from_rate == to_rate or len(pcm) == 0:
         return pcm.astype(np.int16)
+    x = pcm.astype(np.float64)
+    if to_rate < from_rate and x.size > _LOWPASS_TAPS:
+        x = np.convolve(x, _lowpass_taps(0.45 * to_rate, from_rate), mode="same")
     duration_s = len(pcm) / from_rate
     n_out = max(1, int(round(duration_s * to_rate)))
     x_old = np.linspace(0.0, duration_s, num=len(pcm), endpoint=False)
     x_new = np.linspace(0.0, duration_s, num=n_out, endpoint=False)
-    resampled = np.interp(x_new, x_old, pcm.astype(np.float64))
+    resampled = np.interp(x_new, x_old, x)
     return np.clip(resampled, -32768, 32767).astype(np.int16)
 
 
