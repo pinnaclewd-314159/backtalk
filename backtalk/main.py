@@ -1400,7 +1400,23 @@ async def amain():
             # that fired in the meantime resolves first, or the drain would
             # wait on a ResultMessage the CLI is withholding for an answer.
             _deny_pending()
-            active_brain = brain if connectivity.is_online() else local_brain
+            # Two reasons to fall back, not one. Connectivity was the
+            # only trigger until 2026-09-18, which is why the voice line
+            # went SILENT when the plan's 5-hour window ran out: the
+            # internet was fine, so nothing ever switched. Threshold lives
+            # in backtalk.json (local_fallback.quota_threshold); deleting
+            # that key restores the old connectivity-only rule with no
+            # code change.
+            out_of_quota = brain.quota_exhausted()
+            active_brain = (brain if connectivity.is_online() and not out_of_quota
+                            else local_brain)
+            if out_of_quota and connectivity.is_online():
+                used = (brain.quota_used.get("five_hour") or (None,))[0]
+                log(f"[brain] 5-hour plan window spent "
+                    f"({used:.0%} used) -- answering on the local brain "
+                    f"until it resets" if used is not None else
+                    "[brain] 5-hour plan window spent -- answering on the "
+                    "local brain until it resets")
             if active_brain is brain:
                 await brain.reset_turn()
             # Cross-channel catch-up (local/house voice only — see

@@ -31,6 +31,7 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
@@ -65,6 +66,11 @@ class WarmBrain:
         # Session usage, spoken on request ("usage report").
         self.session = {"turns": 0, "out_tokens": 0, "in_tokens": 0,
                         "cost": 0.0}
+        # {window: (utilization 0..1 or None, unix time it was read)}.
+        # Held in memory rather than read back from the signal bus: the
+        # bus file is written only when show_usage is on, and the quota
+        # fallback must work whether or not the face is drawing it.
+        self.quota_used = {}
         self._client: ClaudeSDKClient | None = None
         # The session to reattach to at the FIRST start only (config key
         # resume_last_session). Consumed on use: a desync rebuild in
@@ -192,7 +198,14 @@ class WarmBrain:
         swallowed and the readout simply goes quiet. It must never cost
         a turn, so it is also bounded -- an unanswered control request
         would otherwise hang the voice line mid-conversation."""
-        if not CFG.get("show_usage"):
+        # Two independent reasons to ask the CLI: the face wants to draw
+        # the number, or the quota fallback needs to know whether the plan
+        # is spent. Either is enough to PULL. Only show_usage is enough to
+        # PUBLISH -- see the set_rate_limit call below.
+        want_display = bool(CFG.get("show_usage"))
+        want_fallback = bool(
+            (CFG.get("local_fallback") or {}).get("quota_threshold"))
+        if not (want_display or want_fallback):
             return
         try:
             usage = await asyncio.wait_for(
@@ -213,9 +226,45 @@ class WarmBrain:
                 resets = w.get("resets_at")
                 if isinstance(resets, str):
                     resets = int(datetime.fromisoformat(resets).timestamp())
-                signals.set_rate_limit(window, pct, resets)
+                self.quota_used[window] = (pct, time.time())
+                # Publishing stays gated on show_usage ALONE. That is a
+                # privacy default, not a performance one: this is the
+                # account holder's own spend and it renders on a face that
+                # may be pointed at a camera. The fallback reads the
+                # in-memory value above and never needs the file.
+                if want_display:
+                    signals.set_rate_limit(window, pct, resets)
         except Exception:
             pass
+
+    # How old a quota reading may be before it stops counting. The pull
+    # runs on the turn loop, so a reading older than this means readings
+    # have stopped arriving -- which _pull_rate_limits' own docstring warns
+    # can happen without anyone doing anything wrong.
+    QUOTA_MAX_AGE_S = 900
+
+    def quota_exhausted(self) -> bool:
+        """True only when the 5-hour window is genuinely at the threshold.
+
+        EVERY uncertain case returns False, deliberately: no threshold
+        configured, no reading yet, an unparseable reading, or a stale one
+        all mean "keep using the cloud". A broken sensor must never be the
+        thing that quietly downgrades Sir to the local brain -- that is the
+        failure that would be hardest to notice and easiest to live with
+        wrongly.
+        """
+        threshold = (CFG.get("local_fallback") or {}).get("quota_threshold")
+        if not threshold:
+            return False
+        reading = self.quota_used.get("five_hour")
+        if not reading:
+            return False
+        used, read_at = reading
+        if used is None:
+            return False
+        if time.time() - read_at > self.QUOTA_MAX_AGE_S:
+            return False
+        return used >= threshold
 
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,

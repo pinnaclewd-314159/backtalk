@@ -264,6 +264,20 @@ DEFAULTS = {
         "poll_interval_s": 20.0,
         "poll_timeout_s": 4.0,
         "poll_threshold": 2,
+        # Fall back to the local brain when this fraction of the plan's
+        # 5-hour window is spent, so the voice line degrades instead of
+        # going silent mid-afternoon. Before this existed the fallback
+        # triggered on connectivity ALONE: running out of plan while the
+        # internet was fine simply produced silence.
+        #
+        # DELETE THIS KEY and the old connectivity-only rule is back,
+        # with no code change. That is deliberate -- it is the escape
+        # hatch, and it is one line of JSON plus a restart.
+        #
+        # Every uncertain reading counts as "not exhausted" (see
+        # WarmBrain.quota_exhausted), because a broken sensor must never
+        # be the thing that downgrades the voice line.
+        "quota_threshold": 0.98,
     },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
