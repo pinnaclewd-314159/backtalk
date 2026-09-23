@@ -76,3 +76,15 @@ class SessionHygiene:
     def seconds_idle(self, now: float | None = None) -> float:
         now = now if now is not None else time.monotonic()
         return now - self._last_activity
+
+    def should_clear(self, idle_s: float) -> bool:
+        return idle_s >= self.cfg["idle_clear_minutes"] * 60
+
+    def should_compact(self, fraction: float | None) -> bool:
+        if fraction is None:
+            return False
+        return fraction >= self.cfg["compact_context_threshold"]
+
+    def compaction_cap_reached(self) -> bool:
+        return (self._compactions_this_session
+                >= self.cfg["max_compactions_per_session"])
