@@ -279,6 +279,25 @@ DEFAULTS = {
         # be the thing that downgrades the voice line.
         "quota_threshold": 0.98,
     },
+    # Middle fallback tier: cloud Claude -> n9router's "jarvis-voice-
+    # fallback" combo (Kimi K2.5 first, five more behind it, tried in
+    # order) -> local Qwen3-4B. Used when the 5-hour plan window above
+    # is spent but connectivity is fine, so quota exhaustion no longer
+    # drops straight to the local brain's narrow HA-only scope — the
+    # local brain is now reserved for genuine connectivity loss.
+    # n9router must already be running (its own Windows Scheduled Task)
+    # with the combo created on its dashboard; this block only points
+    # at it.
+    "n9_fallback": {
+        "enabled": False,
+        "base_url": "http://127.0.0.1:20128",
+        "model": "jarvis-voice-fallback",
+        # Generous on purpose: the combo's live legs include a
+        # reasoning model (Gemini 3.6 Flash) whose latency has been
+        # observed swinging from ~20s to ~35s+ per turn. This is
+        # already the degraded tier -- a slow reply beats a failed one.
+        "timeout_s": 60.0,
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.

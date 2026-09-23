@@ -244,27 +244,35 @@ class WarmBrain:
     QUOTA_MAX_AGE_S = 900
 
     def quota_exhausted(self) -> bool:
-        """True only when the 5-hour window is genuinely at the threshold.
+        """True when either the 5-hour or 7-day window is genuinely at the
+        threshold.
 
         EVERY uncertain case returns False, deliberately: no threshold
         configured, no reading yet, an unparseable reading, or a stale one
         all mean "keep using the cloud". A broken sensor must never be the
         thing that quietly downgrades Sir to the local brain -- that is the
         failure that would be hardest to notice and easiest to live with
-        wrongly.
+        wrongly. Checking seven_day too (added 2026-09-21): the weekly cap
+        can be spent while the current 5-hour reading still looks fine, and
+        that case must trip the fallback exactly like a 5-hour hit does --
+        otherwise the voice line keeps answering on a cloud tier that is
+        actually out for the week.
         """
         threshold = (CFG.get("local_fallback") or {}).get("quota_threshold")
         if not threshold:
             return False
-        reading = self.quota_used.get("five_hour")
-        if not reading:
-            return False
-        used, read_at = reading
-        if used is None:
-            return False
-        if time.time() - read_at > self.QUOTA_MAX_AGE_S:
-            return False
-        return used >= threshold
+        for window in ("five_hour", "seven_day"):
+            reading = self.quota_used.get(window)
+            if not reading:
+                continue
+            used, read_at = reading
+            if used is None:
+                continue
+            if time.time() - read_at > self.QUOTA_MAX_AGE_S:
+                continue
+            if used >= threshold:
+                return True
+        return False
 
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,

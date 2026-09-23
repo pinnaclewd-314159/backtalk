@@ -76,6 +76,7 @@ from backtalk import web_client
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.local_brain import LocalBrain
+from backtalk.n9_brain import N9Brain
 from backtalk import wakeword
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            wait_for_wake, warm as warm_ears)
@@ -987,6 +988,11 @@ async def amain():
                               base_url=lf_cfg.get("base_url",
                                                   "http://127.0.0.1:8712"),
                               speak_fn=mouth.say)
+    n9_cfg = CFG.get("n9_fallback", {})
+    n9_brain = N9Brain(base_url=n9_cfg.get("base_url",
+                                           "http://127.0.0.1:20128"),
+                        model=n9_cfg.get("model", "jarvis-voice-fallback"),
+                        timeout_s=n9_cfg.get("timeout_s", 45.0))
 
     async def _on_connectivity_change(online: bool):
         if online:
@@ -1050,6 +1056,14 @@ async def amain():
         # told the real initial state directly (no on_change fired for
         # it), so this doesn't double up with the poll loop's own
         # detection.
+        #
+        # Goes straight to local_brain, not n9_brain, on purpose: a
+        # failed brain.start()/_warmup() here doesn't tell you WHY it
+        # failed (not signed in, quota exhausted, or genuinely offline
+        # all look the same from here), so there's no reliable signal
+        # yet to route through n9router instead. Once the session is up,
+        # handle()'s per-turn check has real connectivity + quota
+        # readings and routes properly from the next turn on.
         booted_offline = True
         mouth.say("I couldn't reach my brain at startup, so I'm "
                   "starting in local device-control mode until the "
@@ -1400,23 +1414,33 @@ async def amain():
             # that fired in the meantime resolves first, or the drain would
             # wait on a ResultMessage the CLI is withholding for an answer.
             _deny_pending()
-            # Two reasons to fall back, not one. Connectivity was the
-            # only trigger until 2026-09-18, which is why the voice line
-            # went SILENT when the plan's 5-hour window ran out: the
-            # internet was fine, so nothing ever switched. Threshold lives
-            # in backtalk.json (local_fallback.quota_threshold); deleting
-            # that key restores the old connectivity-only rule with no
-            # code change.
+            # Three tiers, not two. Connectivity-only was the rule until
+            # 2026-09-18, which is why the voice line went SILENT when
+            # the plan's 5-hour window ran out: the internet was fine, so
+            # nothing ever switched. A middle tier was added 2026-09-21:
+            # quota exhaustion while online now routes through n9router's
+            # combo (a real stand-in conversation) rather than straight
+            # to the local brain's narrow HA-only scope -- that stays
+            # reserved for genuine connectivity loss. Thresholds/toggles
+            # live in backtalk.json (local_fallback.quota_threshold,
+            # n9_fallback.enabled); deleting quota_threshold restores the
+            # old connectivity-only rule with no code change.
             out_of_quota = brain.quota_exhausted()
-            active_brain = (brain if connectivity.is_online() and not out_of_quota
-                            else local_brain)
-            if out_of_quota and connectivity.is_online():
+            online = connectivity.is_online()
+            if online and not out_of_quota:
+                active_brain = brain
+            elif online and out_of_quota and n9_cfg.get("enabled"):
+                active_brain = n9_brain
+            else:
+                active_brain = local_brain
+            if out_of_quota and online:
                 used = (brain.quota_used.get("five_hour") or (None,))[0]
+                dest = "n9router" if active_brain is n9_brain else "the local brain"
                 log(f"[brain] 5-hour plan window spent "
-                    f"({used:.0%} used) -- answering on the local brain "
+                    f"({used:.0%} used) -- answering on {dest} "
                     f"until it resets" if used is not None else
-                    "[brain] 5-hour plan window spent -- answering on the "
-                    "local brain until it resets")
+                    f"[brain] 5-hour plan window spent -- answering on "
+                    f"{dest} until it resets")
             if active_brain is brain:
                 await brain.reset_turn()
             # Cross-channel catch-up (local/house voice only — see

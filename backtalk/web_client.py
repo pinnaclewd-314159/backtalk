@@ -200,37 +200,85 @@ def _static_response(static_dir: Path, path: str) -> Response:
     return Response(200, "OK", headers, body)
 
 
+def _bus_rate_limits():
+    """The OTHER live source: `.voice_rate_limits` in signals_dir, which a
+    voice session keeps current in real time via this same process's own
+    private usage poll (see brain.py's `_pull_rate_limits`). Deliberately
+    NOT wired as a writer for the canonical usage_file -- Sir rejected
+    that exact mechanism for that exact file on 2026-09-16 ("that seems
+    really janky") because it is undocumented, only updates mid-voice-
+    turn, and can go silent on any CLI update. Reading it here as a
+    fallback carries none of that risk into the canonical file; it only
+    widens what this ONE reader will look at. No file has a captured_at
+    of its own, so the file's mtime stands in for one. Returns
+    (rate_limits_dict, epoch) or (None, None) when the bus has nothing
+    to say. Mirrors ai-visualizer's server.py `_bus_rate_limits` --
+    deliberately, same reason the rest of this function is a port."""
+    try:
+        p = Path(CFG["signals_dir"]) / ".voice_rate_limits"
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        epoch = p.stat().st_mtime
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, None
+    rl = {}
+    for window in ("five_hour", "seven_day"):
+        w = raw.get(window) or {}
+        pct = w.get("utilization")
+        if pct is None:
+            continue
+        rl[window] = {"used_percentage": pct * 100,
+                      "resets_at": w.get("resets_at")}
+    return (rl, epoch) if rl else (None, None)
+
+
 def _usage_payload():
     """Plan usage for the page's readout, in the same shape ai-visualizer's
     server.py serves at its own /rate_limit -- deliberately identical, so
     the widget is a port of that one rather than a second implementation
     that can drift away from it.
 
-    Returns None when the feature is switched off or the file cannot be
-    read, which the caller turns into a 404 so the widget hides itself
-    for good instead of polling a dead endpoint every three seconds.
+    Returns None when the feature is switched off, which the caller
+    turns into a 404 so the widget hides itself for good instead of
+    polling a dead endpoint every three seconds.
 
     `captured_at_epoch` is passed through on purpose: nothing writes that
     file unless a Claude Code session is live, so a reading can age, and
     showing a stale percentage as if it were current would be a lie. The
-    browser decides what counts as stale; it is not filtered out here."""
+    browser decides what counts as stale; it is not filtered out here.
+
+    FALLBACK, added 2026-09-20. usage_file only updates from an
+    interactive terminal session, so it goes stale for the whole stretch
+    of a voice-only session even though a live number exists elsewhere
+    (see `_bus_rate_limits`). Whichever of the two sources is actually
+    fresher wins for the five_hour/seven_day numbers; model and
+    context_pct still come from usage_file alone since the bus doesn't
+    carry them."""
     raw = (CFG.get("usage_file") or "").strip()
-    if not raw:
+    payload = {}
+    if raw:
+        try:
+            payload = json.loads(Path(raw).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+    canonical_epoch = (payload.get("captured_at_epoch")
+                       if payload.get("rate_limits_present") else None)
+    bus_rl, bus_epoch = _bus_rate_limits()
+    if bus_rl and (canonical_epoch is None or bus_epoch > canonical_epoch):
+        rl, epoch = bus_rl, bus_epoch
+    elif payload.get("rate_limits_present"):
+        rl, epoch = (payload.get("rate_limits") or {}), canonical_epoch
+    elif not raw and not bus_rl:
+        # Feature fully switched off: no usage_file configured and no
+        # live bus reading either -- the caller's original off-switch.
         return None
-    try:
-        payload = json.loads(Path(raw).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not payload.get("rate_limits_present"):
-        # Genuinely absent (before the first response, or a plan without
-        # published limits). A real state, not an error.
+    else:
+        # Neither source has anything -- genuinely absent, not an error.
         return {"present": False,
                 "captured_at_epoch": payload.get("captured_at_epoch")}
-    rl = payload.get("rate_limits") or {}
     ctx = payload.get("context_window") or {}
     return {
         "present": True,
-        "captured_at_epoch": payload.get("captured_at_epoch"),
+        "captured_at_epoch": epoch,
         "model": payload.get("model"),
         "context_pct": ctx.get("used_percentage"),
         "five_hour": rl.get("five_hour"),
