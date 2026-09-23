@@ -127,3 +127,35 @@ class SessionHygiene:
     async def run_full_summary_and_clear(self, brain) -> bool:
         return await self._checkpoint_then(brain, _FULL_SUMMARY_PROMPT,
                                            "/clear")
+
+    async def get_context_fraction(self, brain) -> float | None:
+        ctx = await brain.context_usage()
+        return context_occupied_fraction(ctx)
+
+    async def tick(self, brain, turn_lock, is_online_fn):
+        try:
+            if turn_lock.is_active() or not is_online_fn():
+                return
+            idle_s = self.seconds_idle()
+            if self.should_clear(idle_s):
+                log(f"[hygiene] idle {idle_s / 60:.0f}min, no activity "
+                    "-- checkpointing and clearing")
+                if await self.run_clear(brain):
+                    self.mark_activity()
+                return
+            fraction = await self.get_context_fraction(brain)
+            if self.should_compact(fraction):
+                if self.compaction_cap_reached():
+                    log(f"[hygiene] context at {fraction:.0%}, compaction "
+                        "cap hit -- full summary and clear instead")
+                    await self.run_full_summary_and_clear(brain)
+                    return
+                log(f"[hygiene] context at {fraction:.0%} "
+                    f"({self._compactions_this_session}/"
+                    f"{self.cfg['max_compactions_per_session']} "
+                    "compactions this session) -- checkpointing "
+                    "and compacting")
+                if await self.run_compact(brain):
+                    self._compactions_this_session += 1
+        except Exception as e:
+            log(f"[hygiene] tick failed: {e!r}")
