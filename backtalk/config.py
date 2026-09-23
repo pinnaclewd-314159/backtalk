@@ -298,6 +298,21 @@ DEFAULTS = {
         # already the degraded tier -- a slow reply beats a failed one.
         "timeout_s": 60.0,
     },
+    "session_hygiene": {
+        "enabled": False,
+        # Minutes of no utterance from any source before an automatic
+        # checkpoint + /clear fires.
+        "idle_clear_minutes": 60,
+        # Fraction of context occupied (0..1) that triggers an
+        # automatic checkpoint + /compact.
+        "compact_context_threshold": 0.60,
+        # After this many automatic compactions in one running process,
+        # a further trigger does a full summary + /clear instead of a
+        # 4th compact.
+        "max_compactions_per_session": 3,
+        # How often the watcher checks idle time and context usage.
+        "check_interval_s": 60,
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
