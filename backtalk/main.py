@@ -993,6 +993,14 @@ async def amain():
                                            "http://127.0.0.1:20128"),
                         model=n9_cfg.get("model", "jarvis-voice-fallback"),
                         timeout_s=n9_cfg.get("timeout_s", 45.0))
+    from backtalk.hygiene import SessionHygiene
+    hygiene = SessionHygiene(CFG.get("session_hygiene", {}))
+    hygiene_task = None
+    if CFG.get("session_hygiene", {}).get("enabled"):
+        hygiene_task = asyncio.create_task(
+            hygiene.watch(brain, turn_lock,
+                          lambda: connectivity.is_online))
+        log("[backtalk] session hygiene watcher started")
 
     async def _on_connectivity_change(online: bool):
         if online:
@@ -1646,6 +1654,8 @@ async def amain():
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
         if speak_task and not speak_task.done():
             speak_task.cancel()
+        if hygiene_task and not hygiene_task.done():
+            hygiene_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")
