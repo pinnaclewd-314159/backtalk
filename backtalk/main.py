@@ -993,6 +993,15 @@ async def amain():
                                            "http://127.0.0.1:20128"),
                         model=n9_cfg.get("model", "jarvis-voice-fallback"),
                         timeout_s=n9_cfg.get("timeout_s", 45.0))
+    from backtalk.hygiene import SessionHygiene
+    hygiene = SessionHygiene(CFG.get("session_hygiene", {}))
+    hygiene_task = None
+    if CFG.get("session_hygiene", {}).get("enabled"):
+        hygiene_task = asyncio.create_task(
+            hygiene.watch(brain, turn_lock,
+                          lambda: connectivity.is_online(),
+                          lambda: _AUTOAPPROVE["on"]))
+        log("[backtalk] session hygiene watcher started")
 
     async def _on_connectivity_change(online: bool):
         if online:
@@ -1300,6 +1309,7 @@ async def amain():
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
+        hygiene.mark_activity()
         nonlocal speak_task, turn_epoch
         prev_owner = turn_lock.current_owner()
         # try_acquire returns this acquisition's EPOCH (a positive int) or
@@ -1403,6 +1413,11 @@ async def amain():
                 except Exception:
                     pass
                 speak_task = None
+            # A hygiene cycle may be mid-checkpoint on the SAME shared
+            # SDK stream this real turn is about to use -- interrupt
+            # it first, or both sides read garbled, interleaved
+            # messages (see hygiene.py's module docstring).
+            await hygiene.preempt()
             verb = verb or console_match(text)
             if verb:
                 await run_console(verb)
@@ -1645,6 +1660,8 @@ async def amain():
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
         if speak_task and not speak_task.done():
             speak_task.cancel()
+        if hygiene_task and not hygiene_task.done():
+            hygiene_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")
