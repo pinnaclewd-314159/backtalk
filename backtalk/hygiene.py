@@ -30,6 +30,40 @@ import time
 from backtalk.vlog import log
 
 
+def context_occupied_fraction(ctx_usage) -> float | None:
+    """0..1 fraction of context occupied, or None if it can't be
+    computed. Mirrors _spoken_usage's category rules (main.py:426-439):
+    'free' and 'buffer' categories never count as occupied; the total
+    is occupied + the 'Free space' category's own tokens. Never
+    raises -- a malformed payload must never crash the watcher."""
+    try:
+        cats = (getattr(ctx_usage, "categories", None)
+                or (ctx_usage or {}).get("categories") or [])
+    except AttributeError:
+        return None
+    occupied = 0
+    free = 0
+    saw_free = False
+    for c in cats:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name", "")).lower()
+        tokens = int(c.get("tokens") or 0)
+        if "free" in name:
+            free += tokens
+            saw_free = True
+        elif "buffer" in name:
+            continue
+        else:
+            occupied += tokens
+    if not saw_free:
+        return None
+    total = occupied + free
+    if total <= 0:
+        return None
+    return occupied / total
+
+
 class SessionHygiene:
     def __init__(self, cfg: dict, now: float | None = None):
         self.cfg = cfg
