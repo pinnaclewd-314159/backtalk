@@ -999,7 +999,8 @@ async def amain():
     if CFG.get("session_hygiene", {}).get("enabled"):
         hygiene_task = asyncio.create_task(
             hygiene.watch(brain, turn_lock,
-                          lambda: connectivity.is_online))
+                          lambda: connectivity.is_online(),
+                          lambda: _AUTOAPPROVE["on"]))
         log("[backtalk] session hygiene watcher started")
 
     async def _on_connectivity_change(online: bool):
@@ -1412,6 +1413,11 @@ async def amain():
                 except Exception:
                     pass
                 speak_task = None
+            # A hygiene cycle may be mid-checkpoint on the SAME shared
+            # SDK stream this real turn is about to use -- interrupt
+            # it first, or both sides read garbled, interleaved
+            # messages (see hygiene.py's module docstring).
+            await hygiene.preempt()
             verb = verb or console_match(text)
             if verb:
                 await run_console(verb)

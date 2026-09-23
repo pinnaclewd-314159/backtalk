@@ -72,6 +72,22 @@ class HygieneCommandsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(brain.commands[1], "/clear")
         self.assertIn("summary", brain.commands[0].lower())
 
+    async def test_run_clear_fails_on_empty_checkpoint_reply(self):
+        """Review finding #9: an empty/interrupted checkpoint reply
+        must not be treated as success -- an empty string has no
+        'error:' prefix but proves nothing was actually written."""
+        h = self.make()
+        brain = FakeBrain(responses=[""])
+        ok = await h.run_clear(brain)
+        self.assertFalse(ok)
+        self.assertEqual(len(brain.commands), 1)
+
+    async def test_run_compact_fails_on_empty_command_reply(self):
+        h = self.make()
+        brain = FakeBrain(responses=["ok", ""])
+        ok = await h.run_compact(brain)
+        self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

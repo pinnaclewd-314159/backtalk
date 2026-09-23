@@ -21,7 +21,8 @@ class HygieneWatchTest(unittest.IsolatedAsyncioTestCase):
         h.tick = AsyncMock(return_value=None)
         task = asyncio.create_task(
             h.watch(brain=object(), turn_lock=object(),
-                    is_online_fn=lambda: True))
+                    is_online_fn=lambda: True,
+                    is_autoapprove_fn=lambda: True))
         await asyncio.sleep(0.17)   # ~3 intervals
         task.cancel()
         try:
@@ -35,7 +36,8 @@ class HygieneWatchTest(unittest.IsolatedAsyncioTestCase):
         h.tick = AsyncMock(return_value=None)
         task = asyncio.create_task(
             h.watch(brain=object(), turn_lock=object(),
-                    is_online_fn=lambda: True))
+                    is_online_fn=lambda: True,
+                    is_autoapprove_fn=lambda: True))
         await asyncio.sleep(0.06)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):

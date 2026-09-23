@@ -24,6 +24,13 @@ brain.command() channel the spoken "clear"/"compact" verbs already use
 Deliberately silent: Sir is very likely not in the room when this
 fires, so nothing here calls mouth.say(). Everything goes through
 log() only.
+
+Final-review fix pass (2026-09-23): a hygiene cycle runs as a
+cancellable task (see preempt()) because WarmBrain has ONE shared SDK
+message stream -- a real user turn arriving mid-cycle must interrupt
+it before handle()'s own reset_turn()/command() calls touch that same
+stream, or both sides read garbled, interleaved messages (the same
+"off-by-one bug" class brain.reset_turn's own docstring describes).
 """
 import asyncio
 import time
@@ -49,6 +56,12 @@ _FULL_SUMMARY_PROMPT = (
     "your normal startup sequence (VAULT-INDEX.md, priorities, "
     "reminders) and go straight to writing the summary.")
 
+# Backoff after a failed cycle: doubles each consecutive failure,
+# capped so a persistent problem still gets retried eventually rather
+# than being abandoned forever.
+_BACKOFF_BASE_S = 60.0
+_BACKOFF_MAX_S = 1800.0
+
 
 def context_occupied_fraction(ctx_usage) -> float | None:
     """0..1 fraction of context occupied, or None if it can't be
@@ -68,7 +81,10 @@ def context_occupied_fraction(ctx_usage) -> float | None:
         if not isinstance(c, dict):
             continue
         name = str(c.get("name", "")).lower()
-        tokens = int(c.get("tokens") or 0)
+        try:
+            tokens = int(c.get("tokens") or 0)
+        except (TypeError, ValueError):
+            continue
         if "free" in name:
             free += tokens
             saw_free = True
@@ -89,9 +105,37 @@ class SessionHygiene:
         self.cfg = cfg
         self._last_activity = now if now is not None else time.monotonic()
         self._compactions_this_session = 0
+        # Important #3: nothing has happened since construction (which
+        # counts as "since the last clear") -- an idle-clear on an
+        # already-empty session has nothing to do.
+        self._has_activity_since_clear = False
+        # Important #4: backoff state after a failed cycle.
+        self._backoff_until = 0.0
+        self._consecutive_failures = 0
+        # Critical #2: the currently in-flight checkpoint/command
+        # cycle, if any -- so a real user turn can preempt() it.
+        self._cycle_task: asyncio.Task | None = None
 
     def mark_activity(self, now: float | None = None):
         self._last_activity = now if now is not None else time.monotonic()
+        self._has_activity_since_clear = True
+
+    def _reset_after_clear(self, now: float | None = None):
+        """Like mark_activity(), but for OUR OWN successful clear --
+        must NOT re-arm _has_activity_since_clear, or an idle-clear
+        would immediately look eligible to fire again next tick."""
+        self._last_activity = now if now is not None else time.monotonic()
+        self._has_activity_since_clear = False
+
+    def _record_failure(self):
+        self._consecutive_failures += 1
+        delay = min(_BACKOFF_BASE_S * (2 ** (self._consecutive_failures - 1)),
+                    _BACKOFF_MAX_S)
+        self._backoff_until = time.monotonic() + delay
+
+    def _record_success(self):
+        self._consecutive_failures = 0
+        self._backoff_until = 0.0
 
     def seconds_idle(self, now: float | None = None) -> float:
         now = now if now is not None else time.monotonic()
@@ -113,12 +157,12 @@ class SessionHygiene:
                                 slash_cmd: str) -> bool:
         await brain.reset_turn()
         resp = await brain.command(checkpoint_prompt)
-        if resp.startswith("error:"):
-            log(f"[hygiene] checkpoint failed before {slash_cmd}: {resp}")
+        if not resp or resp.startswith("error:"):
+            log(f"[hygiene] checkpoint failed before {slash_cmd}: {resp!r}")
             return False
         resp = await brain.command(slash_cmd)
-        if resp.startswith("error:"):
-            log(f"[hygiene] {slash_cmd} failed: {resp}")
+        if not resp or resp.startswith("error:"):
+            log(f"[hygiene] {slash_cmd} failed: {resp!r}")
             return False
         return True
 
@@ -138,38 +182,94 @@ class SessionHygiene:
         ctx = await brain.context_usage()
         return context_occupied_fraction(ctx)
 
-    async def tick(self, brain, turn_lock, is_online_fn):
+    async def _run_cycle(self, coro) -> bool | None:
+        """Run a checkpoint-then-command coroutine as a cancellable
+        task, so preempt() can interrupt it before it shares the SDK's
+        single message stream with a real user turn. Returns None if
+        preempted (neither success nor failure -- retry later, don't
+        count it as either), the coroutine's own bool result
+        otherwise."""
+        self._cycle_task = asyncio.create_task(coro)
         try:
-            if turn_lock.is_active() or not is_online_fn():
+            return await self._cycle_task
+        except asyncio.CancelledError:
+            log("[hygiene] cycle preempted by a real turn")
+            return None
+        finally:
+            self._cycle_task = None
+
+    async def preempt(self):
+        """Cancel any in-flight hygiene cycle and wait for it to
+        unwind. Call this from handle() before anything else touches
+        the brain, so a hygiene checkpoint/command call is never still
+        reading the shared SDK stream when a real turn starts reading
+        it too. A no-op when no cycle is running."""
+        if self._cycle_task and not self._cycle_task.done():
+            self._cycle_task.cancel()
+            try:
+                await self._cycle_task
+            except asyncio.CancelledError:
+                pass
+
+    async def tick(self, brain, turn_lock, is_online_fn, is_autoapprove_fn):
+        try:
+            if (turn_lock.is_active() or not is_online_fn()
+                    or not is_autoapprove_fn()):
                 return
+            now = time.monotonic()
+            if now < self._backoff_until:
+                return
+            # Some brains (fakes, bare objects in gating tests) don't
+            # define quota_exhausted() at all -- treat that as "not
+            # exhausted" rather than crashing.
+            if getattr(brain, "quota_exhausted", lambda: False)():
+                return
+
             idle_s = self.seconds_idle()
-            if self.should_clear(idle_s):
+            if self.should_clear(idle_s) and self._has_activity_since_clear:
                 log(f"[hygiene] idle {idle_s / 60:.0f}min, no activity "
                     "-- checkpointing and clearing")
-                if await self.run_clear(brain):
-                    self.mark_activity()
+                result = await self._run_cycle(self.run_clear(brain))
+                if result:
+                    self._reset_after_clear()
+                    self._compactions_this_session = 0
+                    self._record_success()
+                elif result is False:
+                    self._record_failure()
                 return
+
             fraction = await self.get_context_fraction(brain)
             if self.should_compact(fraction):
                 if self.compaction_cap_reached():
                     log(f"[hygiene] context at {fraction:.0%}, compaction "
                         "cap hit -- full summary and clear instead")
-                    await self.run_full_summary_and_clear(brain)
+                    result = await self._run_cycle(
+                        self.run_full_summary_and_clear(brain))
+                    if result:
+                        self._reset_after_clear()
+                        self._compactions_this_session = 0
+                        self._record_success()
+                    elif result is False:
+                        self._record_failure()
                     return
                 log(f"[hygiene] context at {fraction:.0%} "
                     f"({self._compactions_this_session}/"
                     f"{self.cfg['max_compactions_per_session']} "
                     "compactions this session) -- checkpointing "
                     "and compacting")
-                if await self.run_compact(brain):
+                result = await self._run_cycle(self.run_compact(brain))
+                if result:
                     self._compactions_this_session += 1
+                    self._record_success()
+                elif result is False:
+                    self._record_failure()
         except Exception as e:
             log(f"[hygiene] tick failed: {e!r}")
 
-    async def watch(self, brain, turn_lock, is_online_fn):
+    async def watch(self, brain, turn_lock, is_online_fn, is_autoapprove_fn):
         """Runs until cancelled -- amain() cancels this task in its
         existing shutdown finally: block (main.py:1644-1654)."""
         interval = self.cfg["check_interval_s"]
         while True:
             await asyncio.sleep(interval)
-            await self.tick(brain, turn_lock, is_online_fn)
+            await self.tick(brain, turn_lock, is_online_fn, is_autoapprove_fn)

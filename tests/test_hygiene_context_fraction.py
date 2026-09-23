@@ -58,5 +58,21 @@ class ContextFractionTest(unittest.TestCase):
         self.assertAlmostEqual(frac, 10 / 100, places=4)
 
 
+    def test_non_numeric_tokens_value_does_not_raise(self):
+        """Review finding #10: the docstring promises this function
+        never raises. int(c.get('tokens') or 0) does raise ValueError
+        on a non-numeric string -- must be caught, not just relied on
+        tick()'s own outer try/except."""
+        ctx = {"categories": [
+            {"name": "Messages", "tokens": "not-a-number"},
+            {"name": "Free space", "tokens": 90},
+        ]}
+        frac = context_occupied_fraction(ctx)  # must not raise
+        # The malformed category is skipped, not counted as occupied --
+        # still computes a real answer from what's left rather than
+        # giving up entirely.
+        self.assertEqual(frac, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
