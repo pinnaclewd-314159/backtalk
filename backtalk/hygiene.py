@@ -25,6 +25,7 @@ Deliberately silent: Sir is very likely not in the room when this
 fires, so nothing here calls mouth.say(). Everything goes through
 log() only.
 """
+import asyncio
 import time
 
 from backtalk.vlog import log
@@ -159,3 +160,11 @@ class SessionHygiene:
                     self._compactions_this_session += 1
         except Exception as e:
             log(f"[hygiene] tick failed: {e!r}")
+
+    async def watch(self, brain, turn_lock, is_online_fn):
+        """Runs until cancelled -- amain() cancels this task in its
+        existing shutdown finally: block (main.py:1644-1654)."""
+        interval = self.cfg["check_interval_s"]
+        while True:
+            await asyncio.sleep(interval)
+            await self.tick(brain, turn_lock, is_online_fn)
