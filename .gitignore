@@ -41,3 +41,6 @@ models/
 
 # Local audio test fixture, regenerated on demand.
 gpu_test.wav
+
+# Isolated implementation worktrees (superpowers:using-git-worktrees).
+.worktrees/
