@@ -34,7 +34,10 @@ _CHECKPOINT_PROMPT = (
     "Per your memory discipline in CLAUDE.md, checkpoint current "
     "session state to the vault now -- today's daily note and any "
     "note whose contextual home this session touched. This is an "
-    "automatic session-hygiene checkpoint, not a request from Sir.")
+    "automatic session-hygiene checkpoint, not a request from Sir. "
+    "This session has already been active -- skip your normal "
+    "startup sequence (VAULT-INDEX.md, priorities, reminders) and go "
+    "straight to writing the checkpoint.")
 
 _FULL_SUMMARY_PROMPT = (
     "Per your memory discipline in CLAUDE.md, this session has hit "
@@ -42,7 +45,9 @@ _FULL_SUMMARY_PROMPT = (
     "today's daily note and every relevant vault note, the same way "
     "you would after a third manual compaction, then confirm when "
     "done. This is an automatic session-hygiene checkpoint, not a "
-    "request from Sir.")
+    "request from Sir. This session has already been active -- skip "
+    "your normal startup sequence (VAULT-INDEX.md, priorities, "
+    "reminders) and go straight to writing the summary.")
 
 
 def context_occupied_fraction(ctx_usage) -> float | None:
