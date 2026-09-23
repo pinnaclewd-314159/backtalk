@@ -29,6 +29,20 @@ import time
 
 from backtalk.vlog import log
 
+_CHECKPOINT_PROMPT = (
+    "Per your memory discipline in CLAUDE.md, checkpoint current "
+    "session state to the vault now -- today's daily note and any "
+    "note whose contextual home this session touched. This is an "
+    "automatic session-hygiene checkpoint, not a request from Sir.")
+
+_FULL_SUMMARY_PROMPT = (
+    "Per your memory discipline in CLAUDE.md, this session has hit "
+    "its automatic compaction cap. Write a full session summary to "
+    "today's daily note and every relevant vault note, the same way "
+    "you would after a third manual compaction, then confirm when "
+    "done. This is an automatic session-hygiene checkpoint, not a "
+    "request from Sir.")
+
 
 def context_occupied_fraction(ctx_usage) -> float | None:
     """0..1 fraction of context occupied, or None if it can't be
@@ -88,3 +102,28 @@ class SessionHygiene:
     def compaction_cap_reached(self) -> bool:
         return (self._compactions_this_session
                 >= self.cfg["max_compactions_per_session"])
+
+    async def _checkpoint_then(self, brain, checkpoint_prompt: str,
+                                slash_cmd: str) -> bool:
+        await brain.reset_turn()
+        resp = await brain.command(checkpoint_prompt)
+        if resp.startswith("error:"):
+            log(f"[hygiene] checkpoint failed before {slash_cmd}: {resp}")
+            return False
+        resp = await brain.command(slash_cmd)
+        if resp.startswith("error:"):
+            log(f"[hygiene] {slash_cmd} failed: {resp}")
+            return False
+        return True
+
+    async def run_clear(self, brain) -> bool:
+        return await self._checkpoint_then(brain, _CHECKPOINT_PROMPT,
+                                           "/clear")
+
+    async def run_compact(self, brain) -> bool:
+        return await self._checkpoint_then(brain, _CHECKPOINT_PROMPT,
+                                           "/compact")
+
+    async def run_full_summary_and_clear(self, brain) -> bool:
+        return await self._checkpoint_then(brain, _FULL_SUMMARY_PROMPT,
+                                           "/clear")
