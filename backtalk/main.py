@@ -1300,6 +1300,7 @@ async def amain():
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
+        hygiene.mark_activity()
         nonlocal speak_task, turn_epoch
         prev_owner = turn_lock.current_owner()
         # try_acquire returns this acquisition's EPOCH (a positive int) or
