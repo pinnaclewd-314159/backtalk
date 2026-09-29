@@ -264,6 +264,10 @@ DEFAULTS = {
         "poll_interval_s": 20.0,
         "poll_timeout_s": 4.0,
         "poll_threshold": 2,
+        # Seconds between prompt-cache warm-ups of the local llama-server
+        # (see LocalBrain.keep_warm). 0 disables. Removes the ~16s
+        # cold-prefill wait on the first offline turn.
+        "warm_interval_s": 300,
         # Fall back to the local brain when this fraction of the plan's
         # 5-hour window is spent, so the voice line degrades instead of
         # going silent mid-afternoon. Before this existed the fallback

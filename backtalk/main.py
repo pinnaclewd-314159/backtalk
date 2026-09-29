@@ -988,6 +988,10 @@ async def amain():
                               base_url=lf_cfg.get("base_url",
                                                   "http://127.0.0.1:8712"),
                               speak_fn=mouth.say)
+    warm_task = None
+    if lf_cfg.get("enabled") and lf_cfg.get("warm_interval_s", 300) > 0:
+        warm_task = asyncio.create_task(
+            local_brain.keep_warm(lf_cfg.get("warm_interval_s", 300)))
     n9_cfg = CFG.get("n9_fallback", {})
     n9_brain = N9Brain(base_url=n9_cfg.get("base_url",
                                            "http://127.0.0.1:20128"),
@@ -1662,6 +1666,8 @@ async def amain():
             speak_task.cancel()
         if hygiene_task and not hygiene_task.done():
             hygiene_task.cancel()
+        if warm_task and not warm_task.done():
+            warm_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")

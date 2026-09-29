@@ -139,6 +139,23 @@ TOOLS = [
 ]
 
 
+def _chat_body(utterance: str, **extra) -> dict:
+    """The one place the llama-server request is built, shared by real turns
+    and warm(), so the cached prefix (system prompt + tools) can never
+    drift apart from what a real turn sends."""
+    return {
+        "model": "local",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": utterance},
+        ],
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "temperature": 0,
+        **extra,
+    }
+
+
 def _parse_duration_seconds(text: str) -> float:
     """Sums every "<number> <unit>" span found, so "5 minutes 30 seconds"
     and "1 hour and 15 minutes" both work - as do spelled-out equivalents
@@ -208,6 +225,37 @@ class LocalBrain:
         # word "timer" in it — LocalBrain has no other turn memory.
         self._awaiting_timer_duration = False
 
+    async def warm(self) -> bool:
+        """Primes llama-server's prompt cache with the system prompt and
+        tool definitions (~490 tokens, ~16s of CPU prefill when cold) so
+        the first real offline turn pays only for the user's words. Sends
+        one throwaway token; never raises."""
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{self._base_url}/v1/chat/completions",
+                    json=_chat_body("Hello.", max_tokens=1))
+                resp.raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    async def keep_warm(self, interval_s: float) -> None:
+        """Re-primes the cache every interval_s, so a llama-server that
+        restarted on its own (task retry, reboot) is warm again before the
+        outage that needs it. Cheap when already warm (prefix cached).
+        Logs only on state changes. interval_s <= 0 disables it."""
+        if interval_s <= 0:
+            return
+        last: Optional[bool] = None
+        while True:
+            ok = await self.warm()
+            if ok != last:
+                log("[local_brain] prompt cache warm" if ok else
+                    "[local_brain] warm-up failed - llama-server unreachable")
+                last = ok
+            await asyncio.sleep(interval_s)
+
     def _start_timer(self, seconds: float, label: str) -> None:
         task = asyncio.create_task(self._run_timer(seconds, label))
         self._timers.add(task)
@@ -260,16 +308,7 @@ class LocalBrain:
             async with httpx.AsyncClient(timeout=self._timeout_s) as client:
                 resp = await client.post(
                     f"{self._base_url}/v1/chat/completions",
-                    json={
-                        "model": "local",
-                        "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": utterance},
-                        ],
-                        "tools": TOOLS,
-                        "tool_choice": "auto",
-                        "temperature": 0,
-                    })
+                    json=_chat_body(utterance))
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as e:
