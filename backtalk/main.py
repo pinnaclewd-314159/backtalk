@@ -27,8 +27,8 @@ spoken reply, and typing while it talks interrupts it.
 
 THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
-session" / "compact the session" / "switch to the deep model" / "back
-to the fast model" / "set effort to low" (or medium, high, max) /
+session" / "compact the session" / "switch to the deep model" /
+"switch to the light model" / "back to the standard model" / "set effort to low" (or medium, high, max) /
 "usage report" / "go hands free" and "push to talk mode" (the MIC) /
 "stop asking for permission" and "start asking again" (permissions,
 called auto-approve, a different axis than the microphone on purpose).
@@ -346,8 +346,14 @@ CONSOLE_VERBS = {
                   "compact context", "slash compact"),
     "deep":      ("switch to the deep model", "use the deep model",
                   "slash model deep"),
-    "fast":      ("switch to the fast model", "use the fast model",
+    # "standard" is the spoken name for the default tier; the older
+    # "fast" phrases stay as silent aliases so nobody hits a dead end.
+    "standard":  ("switch to the standard model", "use the standard model",
+                  "back to the standard model", "slash model standard",
+                  "switch to the fast model", "use the fast model",
                   "back to the fast model", "slash model fast"),
+    "light":     ("switch to the light model", "use the light model",
+                  "slash model light"),
     "usage":     ("usage report", "slash usage"),
     "micopen":   ("go hands free", "hands free mode",
                   "hands free listening", "open mic", "open the mic"),
@@ -1185,7 +1191,8 @@ async def amain():
 
     async def _run_console_inner(verb):
         if (not connectivity.is_online()
-                and (verb in ("clear", "compact", "deep", "fast", "usage")
+                and (verb in ("clear", "compact", "deep", "standard",
+                              "light", "usage")
                      or verb.startswith("effort:"))):
             mouth.say("That's not available while we're offline.")
             return
@@ -1201,13 +1208,18 @@ async def amain():
             say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
             mouth.say("Switching to the deep model. Heads up, replies "
-                      "get slower. Say back to the fast model when "
+                      "get slower. Say back to the standard model when "
                       "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
             say_after = "Deep model online, for this session only."
-        elif verb == "fast":
+        elif verb == "light":
+            resp = await brain.command(f"/model {CFG['light_model']}")
+            say_after = ("Light model online, for this session only. "
+                         "Replies are quicker but simpler. Say back to "
+                         "the standard model when you're done.")
+        elif verb == "standard":
             resp = await brain.command(f"/model {CFG['model']}")
-            say_after = "Back on the fast model."
+            say_after = "Back on the standard model."
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
             resp = await brain.command(f"/effort {lvl}")
