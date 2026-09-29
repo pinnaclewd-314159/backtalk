@@ -157,11 +157,21 @@ class SessionHygiene:
                                 slash_cmd: str) -> bool:
         await brain.reset_turn()
         resp = await brain.command(checkpoint_prompt)
+        # The checkpoint is a real conversational turn -- an empty or
+        # "error:" reply here means nothing was actually written, so
+        # text content IS the right signal for this half.
         if not resp or resp.startswith("error:"):
             log(f"[hygiene] checkpoint failed before {slash_cmd}: {resp!r}")
             return False
         resp = await brain.command(slash_cmd)
-        if not resp or resp.startswith("error:"):
+        # The slash command itself is judged by whether it actually
+        # errored (brain.last_command_is_error, from the SDK's own
+        # ResultMessage.is_error), NOT by whether it returned text.
+        # /clear in particular succeeds with an empty reply every time --
+        # it doesn't talk. Treating that as a failure was the bug: it
+        # meant _reset_after_clear() never ran, idle time never reset,
+        # and the retry backoff settled at its 30-minute cap forever.
+        if getattr(brain, "last_command_is_error", True):
             log(f"[hygiene] {slash_cmd} failed: {resp!r}")
             return False
         return True

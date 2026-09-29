@@ -81,6 +81,13 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # Whether the most recent command() call's ResultMessage came back
+        # with is_error set (or the call timed out). A caller that needs to
+        # know whether a slash command actually succeeded must check THIS,
+        # not the returned text -- commands like /clear routinely succeed
+        # with no assistant text at all (see command()'s own docstring).
+        # None before any command() has run.
+        self.last_command_is_error: bool | None = None
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -282,8 +289,16 @@ class WarmBrain:
         ask_stream cannot see them. Bounded like reset_turn is: this
         stream is not trusted to always deliver, and an unbounded await
         here would deafen the whole voice loop. On timeout the pipe is
-        left marked dirty so the next reset_turn drains or rebuilds."""
+        left marked dirty so the next reset_turn drains or rebuilds.
+
+        Sets last_command_is_error from the ResultMessage's own is_error
+        flag (True on timeout too). A caller that cares whether the
+        command itself succeeded should check that attribute rather than
+        this return value -- /clear in particular normally produces no
+        AssistantMessage at all, so an empty string here is the NORMAL
+        successful reply, not a failure."""
         self._dirty = True
+        self.last_command_is_error = None
         await self._client.query(cmd)
         texts = []
 
@@ -299,12 +314,15 @@ class WarmBrain:
                     self._dirty = False
                     self._tally(msg, count_turn=False)
                     self._remember_session(msg)
+                    self.last_command_is_error = bool(
+                        getattr(msg, "is_error", False))
                     break
 
         try:
             await asyncio.wait_for(_collect(), 90)
         except asyncio.TimeoutError:
             log(f"[brain] console command timed out: {cmd!r}")
+            self.last_command_is_error = True
             return "error: the command timed out"
         return " ".join(texts).strip()
 
