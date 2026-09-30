@@ -7,6 +7,7 @@ brain.last_command_is_error (the SDK ResultMessage's own is_error
 flag) instead, because /clear and /compact routinely -- and
 correctly -- return no text on success at all."""
 import unittest
+from unittest import mock
 
 
 class FakeBrain:
@@ -42,6 +43,12 @@ from backtalk.hygiene import SessionHygiene
 
 
 class HygieneCommandsTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Keep the scenarios these tests provoke out of the live backtalk.log.
+        p = mock.patch("backtalk.hygiene.log")
+        p.start()
+        self.addCleanup(p.stop)
+
     def make(self):
         cfg = {"idle_clear_minutes": 60, "compact_context_threshold": 0.6,
                "max_compactions_per_session": 3, "check_interval_s": 60}

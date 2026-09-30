@@ -2,11 +2,18 @@
 line isn't "idle" from epoch zero), and mark_activity must reset the
 clock every time it's called, from any source."""
 import unittest
+from unittest import mock
 
 from backtalk.hygiene import SessionHygiene
 
 
 class HygieneActivityTest(unittest.TestCase):
+    def setUp(self):
+        # Keep the scenarios these tests provoke out of the live backtalk.log.
+        p = mock.patch("backtalk.hygiene.log")
+        p.start()
+        self.addCleanup(p.stop)
+
     def make(self, now=None, **overrides):
         cfg = {"idle_clear_minutes": 60, "compact_context_threshold": 0.6,
                "max_compactions_per_session": 3, "check_interval_s": 60}
