@@ -197,6 +197,18 @@ DEFAULTS = {
         "timeout_s": 10.0,
         "down_s": 30.0,
     },
+    # Rolling buffer of the last few utterances (the exact audio Whisper
+    # heard, plus what it made of it), so a mistranscription can be replayed
+    # against another model afterwards: tools/replay_utterance.py. Off by
+    # default because these are recordings of whoever is near the mic.
+    # `dir` empty means logs/utterances inside the backtalk folder. Only the
+    # newest `keep` clips are kept, none older than `max_age_hours`.
+    "utterance_buffer": {
+        "enabled": False,
+        "dir": "",
+        "keep": 20,
+        "max_age_hours": 24,
+    },
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.
     #

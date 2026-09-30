@@ -30,7 +30,10 @@ class RemoteSttTests(unittest.TestCase):
         ears._remote_down_until = 0.0
         ears._remote_up = None
         for p in (mock.patch.object(ears, "log"),
-                  mock.patch.dict(ears.CFG, {"stt_remote": dict(ON)})):
+                  # ears.transcribe also feeds the rolling utterance buffer;
+                  # keep these synthetic clips out of the real one.
+                  mock.patch.dict(ears.CFG, {"stt_remote": dict(ON),
+                                             "utterance_buffer": {"enabled": False}})):
             p.start()
             self.addCleanup(p.stop)
 

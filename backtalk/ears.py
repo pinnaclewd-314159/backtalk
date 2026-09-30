@@ -37,6 +37,7 @@ import numpy as np
 import sounddevice as sd
 import webrtcvad
 
+from backtalk import utterances
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -320,6 +321,7 @@ def _add_cuda_dll_dirs():
 # silent. Switched off (the default) this whole block is inert.
 _remote_down_until = 0.0
 _remote_up = None            # last logged state: True / False / None (unknown)
+_tl = threading.local()      # per-thread: did THIS transcription use the remote?
 
 
 def _remote_cfg() -> dict:
@@ -374,6 +376,7 @@ def _transcribe_remote(pcm: np.ndarray, reject_hallucinations: bool):
         _remote_note(False, f"{type(e).__name__}: {str(e)[:60]}")
         return None
     _remote_note(True)
+    _tl.remote_used = True
     return _NONSPEECH.sub("", text).strip()
 
 
@@ -476,6 +479,26 @@ COMPRESSION_RATIO_THRESHOLD = 2.4
 
 
 def transcribe(pcm: np.ndarray, *, reject_hallucinations: bool = False) -> str:
+    """int16 mono 16kHz -> text. The real work is _transcribe_inner (its
+    docstring has the contract); this wrapper also drops the audio into the
+    rolling utterance buffer when that is enabled, so a mishear can be
+    replayed later (see utterances.py). The buffer can never break this call."""
+    ticket = utterances.record(pcm)
+    _tl.remote_used = False
+    t0 = time.time()
+    try:
+        text = _transcribe_inner(pcm, reject_hallucinations=reject_hallucinations)
+    except Exception as e:
+        utterances.note(ticket, None, "remote" if _tl.remote_used else "local",
+                        int((time.time() - t0) * 1000), reject_hallucinations,
+                        error=type(e).__name__)
+        raise
+    utterances.note(ticket, text, "remote" if _tl.remote_used else "local",
+                    int((time.time() - t0) * 1000), reject_hallucinations)
+    return text
+
+
+def _transcribe_inner(pcm: np.ndarray, *, reject_hallucinations: bool = False) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
     if nothing remains, it was silence.
