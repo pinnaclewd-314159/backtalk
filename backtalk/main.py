@@ -671,6 +671,21 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
+async def _warm_voicebox_at_startup(attempts: int = 12, retry_s: float = 15.0):
+    """Startup only: Voicebox's model takes ~50s to load cold, longer than
+    a spoken reply will wait. Retries because the Voicebox task can still
+    be starting when backtalk boots (refused connections 2026-09-29).
+    Stops after the first success or `attempts` failures; never raises."""
+    from backtalk.mouth import warm_voicebox
+    for i in range(attempts):
+        if await asyncio.to_thread(warm_voicebox):
+            log("[mouth] voicebox model warm")
+            return
+        if i < attempts - 1:
+            await asyncio.sleep(retry_s)
+    log("[mouth] voicebox warm-up gave up - first reply may use the fallback voice")
+
+
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, source="local",
                       epoch: int = 0, log_channel: str | None = None):
     """One turn's reply, routed to whichever mouth asked for it.
@@ -998,6 +1013,9 @@ async def amain():
     if lf_cfg.get("enabled") and lf_cfg.get("warm_interval_s", 300) > 0:
         warm_task = asyncio.create_task(
             local_brain.keep_warm(lf_cfg.get("warm_interval_s", 300)))
+    vb_warm_task = None
+    if CFG.get("voicebox", {}).get("enabled"):
+        vb_warm_task = asyncio.create_task(_warm_voicebox_at_startup())
     n9_cfg = CFG.get("n9_fallback", {})
     n9_brain = N9Brain(base_url=n9_cfg.get("base_url",
                                            "http://127.0.0.1:20128"),
@@ -1680,6 +1698,8 @@ async def amain():
             hygiene_task.cancel()
         if warm_task and not warm_task.done():
             warm_task.cancel()
+        if vb_warm_task and not vb_warm_task.done():
+            vb_warm_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")

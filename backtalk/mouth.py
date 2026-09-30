@@ -271,6 +271,21 @@ def _voicebox_ready() -> bool:
     return bool(vb.get("enabled") and vb.get("profile_id") and vb.get("engine"))
 
 
+def warm_voicebox(timeout: float = 180.0) -> bool:
+    """Loads Voicebox's model by rendering one throwaway sentence and
+    discarding the audio (never played). A cold model takes ~50s, past
+    synth_stream's 30s timeout, so without this the first spoken reply
+    after every boot falls back to Kokoro. Blocking; never raises."""
+    if not _voicebox_ready():
+        return False
+    try:
+        for _ in _stream_voicebox("Ready.", timeout):
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _stream_elevenlabs(text: str, timeout: float):
     """ElevenLabs -> ffmpeg streaming decode -> int16 PCM at 44.1kHz.
 
