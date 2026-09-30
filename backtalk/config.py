@@ -269,6 +269,17 @@ DEFAULTS = {
         "crossfade_ms": 50,
         "normalize": True,
     },
+    # Optional remote Kokoro (tools/mini_tts/server.py on another machine),
+    # tried after Voicebox and before the in-process Kokoro, so a Voicebox
+    # outage does not put the voice back on this box's GPU. A failed request
+    # falls through to the local Kokoro for that sentence and skips the
+    # remote for `down_s`. Off by default; set "url" to enable.
+    "tts_remote": {
+        "enabled": False,
+        "url": "",
+        "timeout_s": 10.0,
+        "down_s": 30.0,
+    },
     # Offline fallback: cloud Claude -> local Qwen3-4B via llama-server,
     # for Home Assistant control + a short canned-utility list when the
     # internet is down. See backtalk/docs/superpowers/specs/

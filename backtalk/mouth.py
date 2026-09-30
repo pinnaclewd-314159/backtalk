@@ -50,6 +50,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -271,6 +272,61 @@ def _voicebox_ready() -> bool:
     return bool(vb.get("enabled") and vb.get("profile_id") and vb.get("engine"))
 
 
+# Remote Kokoro: the same voice rendered on another machine (the Mac mini
+# node, tools/mini_tts/server.py), tried after Voicebox and before the
+# in-process Kokoro below, so a Voicebox outage does not put the voice back
+# on this box's GPU. Any failure falls through to the local Kokoro for that
+# sentence and marks the remote down for `down_s`. State changes are logged;
+# failures are never silent. Off (the default) it is inert.
+_kokoro_remote_down_until = 0.0
+_kokoro_remote_up = None      # last logged state: True / False / None (unknown)
+
+
+def _kokoro_remote_cfg() -> dict:
+    c = CFG.get("tts_remote") or {}
+    return c if (c.get("enabled") and c.get("url")) else {}
+
+
+def _kokoro_remote_note(up: bool, why: str = ""):
+    """Log only when the remote's state changes."""
+    global _kokoro_remote_up
+    if up != _kokoro_remote_up:
+        _kokoro_remote_up = up
+        log("[mouth] remote kokoro is up" if up else
+            f"[mouth] remote kokoro unavailable ({why}) - using the local voice")
+
+
+def _stream_kokoro_remote(text: str):
+    """One sentence -> (rate, int16 pcm) from the remote service, or None to
+    use the local Kokoro. Whole clip with a Content-Length, so a body cut
+    short raises inside httpx and lands here as a failure, not half a
+    sentence of audio."""
+    global _kokoro_remote_down_until
+    c = _kokoro_remote_cfg()
+    if not c or time.time() < _kokoro_remote_down_until:
+        return None
+    try:
+        import httpx
+        try:
+            speed = float(CFG.get("speed") or 1.0)
+        except (TypeError, ValueError):
+            speed = 1.0
+        r = httpx.post(c["url"].rstrip("/") + "/synthesize",
+                       json={"text": text, "voice": CFG["voice"], "speed": speed},
+                       timeout=float(c.get("timeout_s", 10.0)))
+        r.raise_for_status()
+        rate = int(r.headers["X-Sample-Rate"])
+        pcm = np.frombuffer(r.content, dtype="<i2").astype(np.int16)
+        if not pcm.size:
+            raise ValueError("empty audio")
+    except Exception as e:
+        _kokoro_remote_down_until = time.time() + float(c.get("down_s", 30.0))
+        _kokoro_remote_note(False, f"{type(e).__name__}: {str(e)[:60]}")
+        return None
+    _kokoro_remote_note(True)
+    return rate, pcm
+
+
 def warm_voicebox(timeout: float = 180.0) -> bool:
     """Loads Voicebox's model by rendering one throwaway sentence and
     discarding the audio (never played). A cold model takes ~50s, past
@@ -430,6 +486,10 @@ def synth_stream(text: str, timeout: float = 30.0):
         except Exception as e:
             log(f"[mouth] elevenlabs failed ({str(e)[:60]}) — "
                 f"falling back to {CFG['voice']}")
+    remote = _stream_kokoro_remote(text)
+    if remote is not None:
+        yield remote
+        return
     for pcm in _stream_kokoro(text):
         yield KOKORO_RATE, pcm
 
