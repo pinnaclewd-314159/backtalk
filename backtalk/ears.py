@@ -312,12 +312,84 @@ def _add_cuda_dll_dirs():
         os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ.get("PATH", "")
 
 
-def warm():
+# Remote STT: a Whisper service on another machine (the Mac mini node, see
+# tools/mini_stt/server.py), tried BEFORE the local model so this box's GPU
+# never has to hold Whisper. Any failure falls back to the local model for
+# that utterance and marks the remote down for `down_s`, so a dead Mac costs
+# one timeout, not one per turn. Transitions are logged; failures never are
+# silent. Switched off (the default) this whole block is inert.
+_remote_down_until = 0.0
+_remote_up = None            # last logged state: True / False / None (unknown)
+
+
+def _remote_cfg() -> dict:
+    c = CFG.get("stt_remote") or {}
+    return c if (c.get("enabled") and c.get("url")) else {}
+
+
+def _remote_note(up: bool, why: str = ""):
+    """Log only when the remote's state changes."""
+    global _remote_up
+    if up != _remote_up:
+        _remote_up = up
+        log("[ears] remote STT is up" if up else
+            f"[ears] remote STT unavailable ({why}) - using the local model")
+
+
+def _remote_healthy() -> bool:
+    """One quick /health probe: is the remote up with its model loaded?"""
+    c = _remote_cfg()
+    if not c:
+        return False
+    try:
+        import httpx
+        r = httpx.get(c["url"].rstrip("/") + "/health", timeout=3.0)
+        r.raise_for_status()
+        j = r.json()
+        ok = bool(j.get("ok") and j.get("warm"))
+    except Exception as e:
+        _remote_note(False, f"{type(e).__name__}")
+        return False
+    _remote_note(ok, "model not loaded yet")
+    return ok
+
+
+def _transcribe_remote(pcm: np.ndarray, reject_hallucinations: bool):
+    """Text from the remote service, or None to use the local model."""
+    global _remote_down_until
+    c = _remote_cfg()
+    if not c or time.time() < _remote_down_until:
+        return None
+    try:
+        import httpx
+        r = httpx.post(c["url"].rstrip("/") + "/transcribe",
+                       params={"reject_hallucinations":
+                               int(bool(reject_hallucinations))},
+                       content=pcm.astype("<i2").tobytes(),
+                       timeout=float(c.get("timeout_s", 10.0)))
+        r.raise_for_status()
+        text = str(r.json()["text"])
+    except Exception as e:
+        _remote_down_until = time.time() + float(c.get("down_s", 30.0))
+        _remote_note(False, f"{type(e).__name__}: {str(e)[:60]}")
+        return None
+    _remote_note(True)
+    return _NONSPEECH.sub("", text).strip()
+
+
+def warm(force_local: bool = False):
     """Load the STT model (first call downloads it to the HF cache).
     Called at startup while the greeting plays, so the first real
-    utterance doesn't pay the load."""
+    utterance doesn't pay the load.
+
+    With a healthy remote STT configured this loads NOTHING and returns
+    None: the local model is loaded lazily, only if the remote fails.
+    `force_local` is that lazy path (transcribe's fallback)."""
     global _model, _backend
     check_microphone()
+    if not force_local and _remote_healthy():
+        log("[ears] remote STT ready - local model not loaded")
+        return None
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -424,7 +496,10 @@ def transcribe(pcm: np.ndarray, *, reject_hallucinations: bool = False) -> str:
     one global model at once now that satellites are a thing. The lock
     is taken around the inference only — never around mic capture — so a
     waiting caller is delayed by one transcription, not by a listen."""
-    model = warm()
+    remote = _transcribe_remote(pcm, reject_hallucinations)
+    if remote is not None:
+        return remote
+    model = warm(force_local=True)
     audio = pcm.astype(np.float32) / 32768.0
     lang = "en" if CFG["stt_model"].endswith(".en") else None
     with _stt_lock:

@@ -187,6 +187,16 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # Optional remote Whisper (tools/mini_stt/server.py on another machine),
+    # tried before the local model so this box's GPU need not hold Whisper.
+    # A failed request falls back to the local model for that utterance and
+    # skips the remote for `down_s`. Off by default; set "url" to enable.
+    "stt_remote": {
+        "enabled": False,
+        "url": "",
+        "timeout_s": 10.0,
+        "down_s": 30.0,
+    },
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.
     #
