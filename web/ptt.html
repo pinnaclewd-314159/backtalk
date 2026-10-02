@@ -114,10 +114,13 @@ instead of bus-file polling (see core.js). See docs/superpowers/specs/
   /* Debug log panel -- no devtools needed, works on any device. HIDDEN
      by default since 2026-09-18: it is diagnostic scaffolding, not
      furniture, and it made the face resize as it filled. Show it with
-     ?debug=1, or let it reveal itself (see dlog()). Deliberately NOT
+     ?debug=1. It NEVER reveals itself (it used to, on any error while the
+     socket was down, which made a brief dropout cover the kiosk screens
+     and resize the face; removed 2026-10-01). It stays in the DOM and keeps
+     collecting text while hidden, so it can still be read over devtools
+     with document.getElementById('dlog').innerText. Deliberately NOT
      deleted -- the forwarding half of it is what ended eight days of
-     blind guessing, and the on-screen half is the only witness when the
-     socket is down. */
+     blind guessing. */
   #dlog{
     display:none;
     flex:0 0 auto;
@@ -792,6 +795,7 @@ const dlogEl = document.getElementById("dlog");
 // nothing on screen.
 if (new URLSearchParams(location.search).has("debug")) dlogEl.classList.add("show");
 const WIRE_RATE = 16000;
+const DLOG_MAX_LINES = 300;
 
 // Declared FIRST, above anything that can read them. sendLog() below
 // touches `ws`, and dlog() calls sendLog() at the top level of this
@@ -847,12 +851,14 @@ function dlog(msg, isErr) {
   const t = new Date().toLocaleTimeString();
   line.textContent = `[${t}] ${msg}`;
   dlogEl.appendChild(line);
+  // Keep only the most recent lines: an always-on kiosk reconnecting every
+  // 2 s through a long outage would otherwise grow this without limit.
+  while (dlogEl.childElementCount > DLOG_MAX_LINES) dlogEl.removeChild(dlogEl.firstChild);
   dlogEl.scrollTop = dlogEl.scrollHeight;
-  // If something fails BEFORE the socket is open, the server never hears
-  // about it and this panel is the only witness left -- which is exactly
-  // how a fatal page error went unseen for eight days. Reveal itself in
-  // precisely that case, and only that case.
-  if (isErr && (!ws || ws.readyState !== WebSocket.OPEN)) dlogEl.classList.add("show");
+  // No auto-reveal. If something fails BEFORE the socket is open the server
+  // never hears about it, so the hidden panel (read with devtools, or shown
+  // with ?debug=1) is the only witness left. That is what an eight-day fatal
+  // page error once needed, and it is why the panel is kept, not deleted.
   (isErr ? console.error : console.log)(msg);
   sendLog({ msg: String(msg), isErr: !!isErr });
 }
